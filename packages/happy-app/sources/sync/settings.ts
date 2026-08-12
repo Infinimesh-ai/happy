@@ -35,11 +35,16 @@ export const SettingsSchema = z.object({
     sessionStatusBarDisplay: z.enum(SESSION_STATUS_BAR_DISPLAY_MODES).describe('Whether/where to show the branch, model, effort, and context status bar'),
     usageLimitShowRemaining: z.boolean().describe('Show plan rate limits as quota remaining instead of quota used'),
 
-    hideInactiveSessions: z.boolean().describe('Hide inactive sessions in the main list'),
+    // Drives the archive-visibility toggle: it hides archived sessions, not
+    // merely disconnected ones. The key keeps its original name because these
+    // settings sync between devices and app versions field by field, with no
+    // rename migration to carry an old key across.
+    hideInactiveSessions: z.boolean().describe('Hide archived sessions in the main list'),
     sortSessionsByActivity: z.boolean().describe('Sort the session list by last activity instead of creation date'),
     expResumeSession: z.boolean().describe('Enable experimental session resume feature'),
     fileDiffsSidebar: z.boolean().describe('Show the file diffs sidebar next to the chat on desktop'),
     groupToolCalls: z.boolean().describe('Collapse consecutive tool calls into grouped containers in chat'),
+    compactToolCalls: z.boolean().describe('Render non-interactive tool calls as compact one-line rows'),
     expImageUpload: z.boolean().describe('Enable experimental image upload in chat'),
     reviewPromptAnswered: z.boolean().describe('Whether the review prompt has been answered'),
     reviewPromptLikedApp: z.boolean().nullish().describe('Whether user liked the app when asked'),
@@ -117,6 +122,7 @@ export const settingsDefaults: Settings = {
     expResumeSession: false,
     fileDiffsSidebar: false,
     groupToolCalls: false,
+    compactToolCalls: true,
     expImageUpload: false,
     reviewPromptAnswered: false,
     reviewPromptLikedApp: null,

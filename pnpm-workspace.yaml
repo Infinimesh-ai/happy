@@ -3,6 +3,7 @@ packages:
   - "packages/happy-agent"
   - "packages/happy-cli"
   - "packages/happy-server"
+  - "packages/happy-server-self-host"
   - "packages/happy-wire"
   - "packages/iscp"
   - "packages/happy-app-logs"

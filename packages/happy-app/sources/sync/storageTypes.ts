@@ -131,6 +131,22 @@ export const MetadataSchema = z.object({
     hostPid: z.number().optional(), // Process ID of the session
     startedBy: z.enum(['daemon', 'terminal']).optional(),
     flavor: z.string().nullish(), // Session flavor/variant identifier
+    /**
+     * Rig's project / worktree identity. Every worktree of the same repo
+     * reports the same `project.id`, and `workspace` names the individual git
+     * worktree (absent when the session runs in the primary tree). `kind` is a
+     * plain string so newer Rig builds can add values without failing here.
+     */
+    project: z.object({
+        id: z.string(),
+        kind: z.string(),
+        name: z.string(),
+    }).passthrough().optional(),
+    workspace: z.object({
+        id: z.string(),
+        kind: z.string(),
+        name: z.string(),
+    }).passthrough().optional(),
     sandbox: z.any().nullish(), // Sandbox config metadata from CLI (or null when disabled)
     dangerouslySkipPermissions: z.boolean().nullish(), // Claude --dangerously-skip-permissions mode (or null when unknown)
     lifecycleState: z.string().optional(),
@@ -225,11 +241,80 @@ const UsageLimitsSchema = z.object({
     }).passthrough()),
 }).passthrough().optional().catch(undefined);
 
+/**
+ * Agent-to-user communication, kept deliberately separate from permissions.
+ * A permission gates an action the agent wants to take; a communication asks
+ * the user for information the agent does not have.
+ *
+ * The top-level `kind` selects the payload and is an open string rather than an
+ * enum, so newer agents can introduce other kinds (a notice, a file pick, a
+ * diff to review) without older clients failing to parse the session. A client
+ * that does not know a kind still sees the communication and tells the user it
+ * cannot be answered here, rather than silently dropping it and leaving the
+ * agent waiting forever.
+ *
+ * Today the only kind is `form`, whose payload is a list of questions.
+ */
+export const AgentQuestionOptionSchema = z.object({
+    label: z.string(),
+    description: z.string().nullish(),
+}).passthrough();
+
+export const AgentQuestionSchema = z.object({
+    id: z.string(),
+    header: z.string(),
+    question: z.string(),
+    options: z.array(AgentQuestionOptionSchema).default([]),
+    multiSelect: z.boolean().nullish(),
+    // Lets the user write an answer the agent did not offer.
+    allowCustom: z.boolean().nullish(),
+    // When false the user may submit without choosing anything.
+    required: z.boolean().nullish(),
+}).passthrough();
+
+/** Payload for `kind: 'form'`. */
+export const AgentFormSchema = z.object({
+    questions: z.array(AgentQuestionSchema).default([]),
+}).passthrough();
+
+export const AgentCommunicationSchema = z.object({
+    kind: z.string(),
+    createdAt: z.number().nullish(),
+    // Joins the communication to the tool call that raised it, when there is one.
+    toolUseId: z.string().nullish(),
+    // Shown when the client does not understand `kind`, so the user learns what
+    // is being asked even though this build cannot render the payload.
+    title: z.string().nullish(),
+    // Present when kind === 'form'.
+    form: AgentFormSchema.nullish(),
+}).passthrough();
+
+export const AgentQuestionAnswerSchema = z.object({
+    options: z.array(z.string()).default([]),
+    custom: z.string().nullish(),
+}).passthrough();
+
+export const CompletedAgentCommunicationSchema = AgentCommunicationSchema.extend({
+    completedAt: z.number().nullish(),
+    status: z.enum(['answered', 'cancelled']),
+    answers: z.record(z.string(), AgentQuestionAnswerSchema).nullish(),
+});
+
+export type AgentQuestionOption = z.infer<typeof AgentQuestionOptionSchema>;
+export type AgentQuestion = z.infer<typeof AgentQuestionSchema>;
+export type AgentForm = z.infer<typeof AgentFormSchema>;
+export type AgentCommunication = z.infer<typeof AgentCommunicationSchema>;
+export type AgentQuestionAnswer = z.infer<typeof AgentQuestionAnswerSchema>;
+export type CompletedAgentCommunication = z.infer<typeof CompletedAgentCommunicationSchema>;
+
 export const AgentStateSchema = z.object({
     controlledByUser: z.boolean().nullish(),
     // Ephemeral runtime state. A malformed snapshot must not invalidate
     // permission requests or the rest of the agent state.
     usageLimits: UsageLimitsSchema,
+    // Pending agent-to-user communications, keyed by request id.
+    communications: z.record(z.string(), AgentCommunicationSchema).nullish(),
+    completedCommunications: z.record(z.string(), CompletedAgentCommunicationSchema).nullish(),
     requests: z.record(z.string(), z.object({
         tool: z.string(),
         arguments: z.any(),
@@ -345,16 +430,82 @@ export const MachineMetadataSchema = z.object({
         grok: z.boolean().optional(),
         openclaw: z.boolean(),
         agy: z.boolean().optional(), // optional: older CLIs don't report agy
+        rig: z.boolean().optional(), // Rig runs its own Happy-connected daemon
         detectedAt: z.number(),
     }).optional(),
+    // Rig registers as its own machine instead of being launched by happy-cli.
+    // Keep its creation catalog so the new-session UI can send Rig-native
+    // provider/model identifiers to the machine RPC.
+    machineKind: z.string().optional(),
+    rigOnly: z.boolean().optional(),
+    rigMetadataVersion: z.number().int().positive().optional(),
+    client: z.object({
+        id: z.string(),
+        name: z.string(),
+        version: z.string(),
+    }).passthrough().optional(),
+    capabilities: z.object({
+        newSession: z.boolean().optional(),
+        resume: z.boolean().optional(),
+        worktrees: z.boolean().optional(),
+    }).passthrough().optional(),
+    // The Rig catalog below mirrors the optionality of MetadataSchema at the top
+    // of this file, which models the same payload for a session. Rig is a
+    // separate codebase shipping on its own schedule, so a field it omits or
+    // sends as null must not fail the parse: a rejected parse returns null for
+    // the ENTIRE machine metadata (see machineEncryption.ts), which would strip
+    // host, platform and CLI availability over an unread reasoning level.
+    // Each block also catches independently, so an unforeseen shape degrades to
+    // "no Rig session creation" rather than "no machine".
+    defaults: z.object({
+        effort: z.string().optional(),
+        modelId: z.string().optional(),
+        permissionMode: z.string().optional(),
+        providerId: z.string().optional(),
+    }).passthrough().optional().catch(undefined),
+    providers: z.array(z.object({
+        id: z.string(),
+        kind: z.string().optional(),
+        name: z.string().optional(),
+    }).passthrough()).optional().catch(undefined),
+    models: z.array(z.object({
+        code: z.string(),
+        value: z.string(),
+        description: z.string().nullish(),
+        id: z.string().optional(),
+        name: z.string().optional(),
+        providerId: z.string().optional(),
+        providerKind: z.string().optional(),
+        providerName: z.string().optional(),
+        provider: z.object({
+            id: z.string(),
+            kind: z.string(),
+            name: z.string(),
+        }).passthrough().optional(),
+        contextWindow: z.number().optional(),
+        serviceTiers: z.array(z.string()).optional(),
+        thinkingLevels: z.array(z.string()).optional(),
+        defaultThinkingLevel: z.string().nullish(),
+    }).passthrough()).optional().catch(undefined),
+    operatingModes: z.array(z.object({
+        code: z.string(),
+        value: z.string(),
+        description: z.string().nullish(),
+        kind: z.string().optional(),
+    }).passthrough()).optional().catch(undefined),
+    sessionCreation: z.object({
+        idempotencyKey: z.string().optional(),
+        pendingRetryAfterMs: z.number().optional(),
+        resultKinds: z.array(z.string()).optional(),
+    }).passthrough().optional().catch(undefined),
     resumeSupport: z.object({
-        rpcAvailable: z.boolean(),
-        requiresSameMachine: z.boolean(),
-        requiresHappyAgentAuth: z.boolean(),
-        happyAgentAuthenticated: z.boolean(),
-        detectedAt: z.number(),
-    }).optional(),
-});
+        rpcAvailable: z.boolean().optional(),
+        requiresSameMachine: z.boolean().optional(),
+        requiresHappyAgentAuth: z.boolean().optional(),
+        happyAgentAuthenticated: z.boolean().optional(),
+        detectedAt: z.number().optional(),
+    }).passthrough().optional().catch(undefined),
+}).passthrough();
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>;
 

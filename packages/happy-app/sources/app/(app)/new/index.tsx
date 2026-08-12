@@ -67,8 +67,26 @@ import {
 import { isRunningOnMac } from '@/utils/platform';
 import { getNewSessionSidebarLayout } from '@/utils/newSessionSidebarLayout';
 import { getAgentPickerItems, getModePickerItems } from '@/utils/newSessionPickerItems';
+import {
+    NEW_SESSION_PICKER_LAYERS,
+    cancelPendingPickerOpenState,
+    resolvePickerToggleAction,
+} from '@/utils/newSessionPickerInteraction';
 import { resolveAgentDefaultConfig } from '@/sync/agentDefaults';
+import { delay } from '@/utils/time';
+import {
+    buildRigSpawnConfiguration,
+    getRigMachineSessionCreation,
+    resolveRigPendingRetryDelayMs,
+} from '@/sync/rigSessionCreation';
+import {
+    buildSpawnRequestSignature,
+    completeSpawnRequest,
+    resolveSpawnRequestId,
+} from '@/sync/spawnRequestId';
+import { resolvePermissionStyle, resolveSelectedOption } from '@/utils/newSessionModeSelection';
 import { MobileGlassSurface } from '@/components/MobileGlass';
+import { getNativeGlassInteractivity } from '@/components/glassInteractionPolicy';
 import { BubblePressable } from '@/components/BubblePressable';
 import { Header } from '@/components/navigation/Header';
 import { MOBILE_GLASS_HEADER_HEIGHT } from '@/components/navigation/headerMetrics';
@@ -80,6 +98,7 @@ import {
 
 // Agent icon assets
 const agentIcons = {
+    rig: require('@/assets/images/icon-rig.png'),
     claude: require('@/assets/images/icon-claude.png'),
     codex: require('@/assets/images/icon-gpt.png'),
     openclaw: require('@/assets/images/icon-openclaw.png'),
@@ -90,6 +109,7 @@ const agentIcons = {
 
 type AgentKey = NewSessionAgentType;
 const ALL_AGENTS: { key: AgentKey; label: string }[] = [
+    { key: 'rig', label: 'rig' },
     { key: 'claude', label: 'claude code' },
     { key: 'codex', label: 'codex' },
     { key: 'openclaw', label: 'openclaw' },
@@ -123,9 +143,8 @@ const NATIVE_PICKER_TOP: Record<PickerType, number> = {
     resume: 192,
 };
 const NATIVE_PICKER_ESTIMATED_HEIGHT = 264;
+const MAX_RIG_PENDING_RESULTS = 3;
 const NATIVE_COMPOSER_RESERVED_HEIGHT = 98;
-
-type PermissionStyle = { color: string; icon: 'play-forward' | 'pause' };
 
 function findPreferredModeIndex<T extends { key: string }>(
     options: T[],
@@ -165,26 +184,6 @@ function normalizePathForComparison(path: string | null | undefined, homeDir?: s
         return null;
     }
     return trimTrailingPathSeparator(resolveAbsolutePath(trimmed, homeDir));
-}
-
-function getPermissionStyle(key: string): PermissionStyle | null {
-    switch (key) {
-        case 'acceptEdits':
-        case 'auto_edit':
-            return { color: '#A78BFA', icon: 'play-forward' };
-        case 'plan':
-            return { color: '#5EABA4', icon: 'pause' };
-        case 'dontAsk':
-        case 'safe-yolo':
-            return { color: '#FBBF24', icon: 'play-forward' };
-        case 'bypassPermissions':
-        case 'yolo':
-            return { color: '#F87171', icon: 'play-forward' };
-        case 'read-only':
-            return { color: '#60A5FA', icon: 'pause' };
-        default:
-            return null;
-    }
 }
 
 // Bottom sheet modal — native formSheet on iOS, slide-up sheet on Android
@@ -325,6 +324,7 @@ function PickerContent({
         return (
             <BubblePressable
                 key={item.key}
+                scaleFeedback={false}
                 style={(p) => [
                     pickerStyles.option,
                     embedded && pickerStyles.embeddedOption,
@@ -424,6 +424,7 @@ function ComposerSettingsContent({
                 {items.map((item) => (
                     <BubblePressable
                         key={item.key}
+                        scaleFeedback={false}
                         onPress={() => onSelect(item.key)}
                         style={(pressedState) => [
                             pickerStyles.option,
@@ -649,7 +650,7 @@ function PathPickerContent({
                             <GlassView
                                 glassEffectStyle="regular"
                                 tintColor="rgba(255,255,255,0.10)"
-                                isInteractive={true}
+                                isInteractive={getNativeGlassInteractivity(true)}
                                 style={[
                                     pickerStyles.doneButtonGlass,
                                     { borderColor: 'rgba(255,255,255,0.16)' },
@@ -722,6 +723,7 @@ function PathPickerContent({
                     return (
                         <BubblePressable
                             key={item.key}
+                            scaleFeedback={false}
                             style={(p) => [
                                 pickerStyles.option,
                                 embedded && pickerStyles.embeddedOption,
@@ -929,10 +931,14 @@ function NewSessionScreen() {
     const [mobileConfigHeight, setMobileConfigHeight] = React.useState(0);
     const [nativePickerMeasuredHeight, setNativePickerMeasuredHeight] = React.useState<number | null>(null);
     const autoSubmitStartedRef = React.useRef(false);
+    const isMountedRef = React.useRef(true);
     const composerInputRef = React.useRef<import('@/components/MultiTextInput').MultiTextInputHandle>(null);
     const pendingPickerRef = React.useRef<PickerType | null>(null);
     const pickerKeyboardSubscriptionRef = React.useRef<ReturnType<typeof Keyboard.addListener> | null>(null);
     const pickerOpenTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+    React.useEffect(() => () => {
+        isMountedRef.current = false;
+    }, []);
 
     // Config collapse — auto-collapses when typing, expands when empty
     const [isConfigExpanded, setIsConfigExpanded] = React.useState(true);
@@ -949,6 +955,14 @@ function NewSessionScreen() {
         () => allMachines.find(m => m.id === selectedMachineId) ?? null,
         [allMachines, selectedMachineId],
     );
+    const selectedRigCreation = React.useMemo(
+        () => getRigMachineSessionCreation(selectedMachine?.metadata),
+        [selectedMachine?.metadata],
+    );
+    const rigCreation = selectedAgent === 'rig' ? selectedRigCreation : null;
+    const supportsWorktree = selectedMachine?.metadata?.rigOnly === true
+        ? selectedRigCreation?.supportsWorktrees ?? false
+        : rigCreation?.supportsWorktrees ?? getSupportsWorktree(selectedAgent);
     const selectedHomeDir = selectedMachine?.metadata?.homeDir;
 
     // Build machine picker items: online first, then offline
@@ -1015,7 +1029,7 @@ function NewSessionScreen() {
     // Fetch existing worktrees from the selected machine/path
     const [worktreeItems, setWorktreeItems] = React.useState<PickerItem[]>([]);
     React.useEffect(() => {
-        if (!selectedMachineId || !debouncedResolvedSelectedPath) {
+        if (!supportsWorktree || !selectedMachineId || !debouncedResolvedSelectedPath) {
             setWorktreeItems([]);
             return;
         }
@@ -1033,7 +1047,7 @@ function NewSessionScreen() {
             })));
         });
         return () => { cancelled = true; };
-    }, [debouncedResolvedSelectedPath, selectedMachineId, selectedMachine]);
+    }, [debouncedResolvedSelectedPath, selectedMachineId, selectedMachine, supportsWorktree]);
 
     React.useEffect(() => {
         if (worktreeKey === '__none__' || worktreeKey === '__new__') {
@@ -1103,9 +1117,10 @@ function NewSessionScreen() {
     // Filter available agents based on CLI availability from machine metadata
     const availableAgents = React.useMemo(() => {
         const availability = selectedMachine?.metadata?.cliAvailability;
-        if (!availability) return ALL_AGENTS;
-        return ALL_AGENTS.filter(a => availability[a.key]);
-    }, [selectedMachine]);
+        return ALL_AGENTS.filter((agent) => agent.key === 'rig'
+            ? selectedRigCreation !== null
+            : !availability || availability[agent.key]);
+    }, [selectedMachine, selectedRigCreation]);
 
     // If current agent not available on this machine, switch to first available
     React.useEffect(() => {
@@ -1116,26 +1131,32 @@ function NewSessionScreen() {
 
     // Derive options from agent type
     const permissionModes = React.useMemo<PermissionMode[]>(
-        () => getHardcodedPermissionModes(selectedAgent, t),
-        [selectedAgent],
+        () => rigCreation?.permissionModes ?? getHardcodedPermissionModes(selectedAgent, t),
+        [selectedAgent, rigCreation],
     );
     const modelModes = React.useMemo<ModelMode[]>(
-        () => getHardcodedModelModes(selectedAgent, t),
-        [selectedAgent],
+        () => rigCreation?.models ?? getHardcodedModelModes(selectedAgent, t),
+        [selectedAgent, rigCreation],
     );
 
-    const currentModel = modelModes[modelIndex] ?? modelModes[0];
+    const currentModel = resolveSelectedOption(modelModes, modelIndex);
     const currentModelKey = currentModel?.key ?? 'default';
 
     const effortLevels = React.useMemo<EffortLevel[]>(
-        () => getEffortLevelsForModel(selectedAgent, currentModelKey),
-        [selectedAgent, currentModelKey],
+        () => rigCreation
+            ? rigCreation.effortsForModel(currentModelKey).map((key) => ({ key, name: key }))
+            : getEffortLevelsForModel(selectedAgent, currentModelKey),
+        [selectedAgent, currentModelKey, rigCreation],
     );
-    const effectiveAgentDefaults = React.useMemo(() => (
-        resolveAgentDefaultConfig(agentDefaultOverrides, selectedAgent)
-    ), [agentDefaultOverrides, selectedAgent]);
-
-    const supportsWorktree = getSupportsWorktree(selectedAgent);
+    const effectiveAgentDefaults = React.useMemo(() => rigCreation
+        ? {
+            permissionMode: rigCreation.defaultPermissionMode ?? '',
+            modelMode: rigCreation.defaultModelKey ?? '',
+            effortLevel: rigCreation.defaultEffortForModel(rigCreation.defaultModelKey),
+        }
+        : resolveAgentDefaultConfig(agentDefaultOverrides, selectedAgent), [agentDefaultOverrides, selectedAgent, rigCreation]);
+    const effectiveEffortDefault = rigCreation?.defaultEffortForModel(currentModelKey)
+        ?? effectiveAgentDefaults.effortLevel;
     const showModel = modelModes.length > 1;
     const showEffort = effortLevels.length > 0;
     const showPermission = permissionModes.length > 1;
@@ -1171,30 +1192,33 @@ function NewSessionScreen() {
         }
         setEffortIndex(findPreferredModeIndex(effortLevels, [
             draft.effortLevel,
-            effectiveAgentDefaults.effortLevel,
+            effectiveEffortDefault,
         ]));
-    }, [draft.effortLevel, effectiveAgentDefaults.effortLevel, currentModelKey, effortLevels]);
+    }, [draft.effortLevel, effectiveEffortDefault, currentModelKey, effortLevels]);
 
     // The reference keeps the context controls visible while the keyboard is
     // open. Preserve that on mobile and let users collapse them explicitly.
     const isDesktop = Platform.OS === 'web' || isRunningOnMac();
 
 
-    const toggleConfig = React.useCallback(() => {
-        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-        setActivePicker(null);
-        setIsConfigExpanded(v => !v);
+    const cancelPendingPickerOpen = React.useCallback(() => {
+        cancelPendingPickerOpenState({
+            pendingPickerRef,
+            subscriptionRef: pickerKeyboardSubscriptionRef,
+            timerRef: pickerOpenTimerRef,
+        });
     }, []);
 
-    const cancelPendingPickerOpen = React.useCallback(() => {
-        pendingPickerRef.current = null;
-        pickerKeyboardSubscriptionRef.current?.remove();
-        pickerKeyboardSubscriptionRef.current = null;
-        if (pickerOpenTimerRef.current) {
-            clearTimeout(pickerOpenTimerRef.current);
-            pickerOpenTimerRef.current = null;
-        }
-    }, []);
+    const closePicker = React.useCallback(() => {
+        cancelPendingPickerOpen();
+        setActivePicker(null);
+    }, [cancelPendingPickerOpen]);
+
+    const toggleConfig = React.useCallback(() => {
+        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+        closePicker();
+        setIsConfigExpanded(v => !v);
+    }, [closePicker]);
 
     React.useEffect(() => cancelPendingPickerOpen, [cancelPendingPickerOpen]);
 
@@ -1203,14 +1227,20 @@ function NewSessionScreen() {
     }, [activePicker, composerSettingsPage]);
 
     const togglePicker = React.useCallback((type: PickerType) => {
-        if (activePicker === type || pendingPickerRef.current === type) {
-            cancelPendingPickerOpen();
-            setActivePicker(null);
+        const action = resolvePickerToggleAction({
+            activePicker,
+            pendingPicker: pendingPickerRef.current,
+            requestedPicker: type,
+        });
+        if (action === 'keep-pending') {
+            return;
+        }
+        if (action === 'close-active') {
+            closePicker();
             return;
         }
 
-        cancelPendingPickerOpen();
-        setActivePicker(null);
+        closePicker();
         if (isDesktop || !Keyboard.isVisible()) {
             setActivePicker(type);
             return;
@@ -1228,13 +1258,15 @@ function NewSessionScreen() {
         pickerOpenTimerRef.current = setTimeout(finishOpening, 420);
         composerInputRef.current?.blur();
         Keyboard.dismiss();
-    }, [activePicker, cancelPendingPickerOpen, isDesktop]);
+    }, [activePicker, cancelPendingPickerOpen, closePicker, isDesktop]);
 
     const isOffline = selectedMachine ? !isMachineOnline(selectedMachine) : false;
     const agent = availableAgents.find(a => a.key === selectedAgent) ?? ALL_AGENTS[0];
-    const currentPermission = permissionModes[permissionIndex] ?? permissionModes[0];
-    const currentEffort = effortLevels[effortIndex] ?? effortLevels[0];
-    const permissionStyle = currentPermission?.key !== 'default' ? getPermissionStyle(currentPermission.key) : null;
+    // A Rig machine can publish an empty catalog, so every current pick is
+    // nullable — the composer hides the picker instead of rendering a pick.
+    const currentPermission = resolveSelectedOption(permissionModes, permissionIndex);
+    const currentEffort = resolveSelectedOption(effortLevels, effortIndex);
+    const permissionStyle = resolvePermissionStyle(currentPermission);
     const composerSettingsItems = React.useMemo(() => {
         const items: Array<{
             key: ComposerSettingPickerType;
@@ -1426,11 +1458,12 @@ function NewSessionScreen() {
                 applyResumeSelection(key);
                 break;
         }
-        setActivePicker(null);
+        closePicker();
     }, [
         activePicker,
         applyResumeSelection,
         availableAgents,
+        closePicker,
         draft.setEffortLevel,
         draft.setModelMode,
         draft.setPermissionMode,
@@ -1476,7 +1509,9 @@ function NewSessionScreen() {
     }, [applyResumeSelection, composerSettingsPage, draft.setEffortLevel, draft.setModelMode, draft.setPermissionMode, effortLevels, modelModes, permissionModes]);
 
     // Spawn session handler
-    const handleSend = React.useCallback(async (approvedNewDirectoryCreation: boolean = false) => {
+    const handleSend = React.useCallback(async (
+        approvedNewDirectoryCreation: boolean = false,
+    ) => {
         if (!selectedMachineId || !selectedMachine) {
             Modal.alert(t('common.error'), 'Please select a machine');
             return;
@@ -1490,6 +1525,21 @@ function NewSessionScreen() {
         try {
             const pathToUse = trimPathInput(selectedPath) || '~';
             const absolutePath = resolveAbsolutePath(pathToUse, selectedMachine.metadata?.homeDir);
+            const permissionKey = currentPermission?.key ?? null;
+            // Same key for every retry of this request (directory approval,
+            // pending polling, or the user pressing Start again) so Rig dedupes
+            // instead of spawning a second session. Built from what the user
+            // picked, not from the resolved worktree path, so retrying a "new
+            // worktree" spawn still lands on the session Rig already created.
+            const clientRequestId = resolveSpawnRequestId(buildSpawnRequestSignature({
+                machineId: selectedMachineId,
+                agent: selectedAgent,
+                directory: pathToUse,
+                worktree: supportsWorktree ? worktreeKey : '__none__',
+                modelKey: currentModelKey,
+                permissionMode: permissionKey,
+                effort: currentEffort?.key ?? null,
+            }));
 
             // Handle worktree selection
             let spawnDirectory = absolutePath;
@@ -1498,43 +1548,71 @@ function NewSessionScreen() {
                 // conversation's original working directory (claude --resume
                 // looks the JSONL up via the cwd-derived project dir)
                 spawnDirectory = resumeSession.directory;
-            } else if (worktreeKey === '__new__') {
+            } else if (supportsWorktree && worktreeKey === '__new__') {
                 const worktreeResult = await createWorktree(selectedMachineId, absolutePath);
                 if (!worktreeResult.success) {
                     Modal.alert(t('common.error'), worktreeResult.error || 'Failed to create worktree');
                     return;
                 }
                 spawnDirectory = worktreeResult.worktreePath;
-            } else if (worktreeKey !== '__none__') {
+            } else if (supportsWorktree && worktreeKey !== '__none__') {
                 // Existing worktree — use its path directly
                 spawnDirectory = worktreeKey;
             }
 
-            const result = await machineSpawnNewSession({
-                machineId: selectedMachineId,
-                directory: spawnDirectory,
-                approvedNewDirectoryCreation,
-                agent: selectedAgent,
-                // For codex, 'default' is a concrete ask-first mode (the codex
-                // launch default is yolo) — it must be forwarded. For other
-                // agents 'default' is the ambient no-override value.
-                permissionMode: selectedAgent === 'codex' || currentPermission.key !== 'default' ? currentPermission.key : undefined,
-                modelMode: currentModelKey !== 'default' ? currentModelKey : undefined,
-                effortLevel: currentEffort?.key,
-                resumeClaudeSessionId: resumeSession && selectedAgent === 'claude' ? resumeSession.id : undefined,
-                resumeCodexThreadId: resumeSession && selectedAgent === 'codex' ? resumeSession.id : undefined,
-                resumeGrokSessionId: resumeSession && selectedAgent === 'grok' ? resumeSession.id : undefined,
-            });
+            const spawnOptions = rigCreation
+                ? {
+                    machineId: selectedMachineId,
+                    ...buildRigSpawnConfiguration(selectedMachine.metadata, {
+                        directory: spawnDirectory,
+                        clientRequestId,
+                        approvedNewDirectoryCreation,
+                        modelKey: currentModelKey,
+                        permissionMode: permissionKey,
+                        effort: currentEffort?.key,
+                    }),
+                }
+                : {
+                    machineId: selectedMachineId,
+                    directory: spawnDirectory,
+                    approvedNewDirectoryCreation,
+                    agent: selectedAgent,
+                    // For codex, 'default' is a concrete ask-first mode (the codex
+                    // launch default is yolo) — it must be forwarded. For other
+                    // agents 'default' is the ambient no-override value.
+                    permissionMode: permissionKey && (selectedAgent === 'codex' || permissionKey !== 'default')
+                        ? permissionKey
+                        : undefined,
+                    modelMode: currentModelKey !== 'default' ? currentModelKey : undefined,
+                    effortLevel: currentEffort?.key,
+                    resumeClaudeSessionId: resumeSession && selectedAgent === 'claude' ? resumeSession.id : undefined,
+                    resumeCodexThreadId: resumeSession && selectedAgent === 'codex' ? resumeSession.id : undefined,
+                    resumeGrokSessionId: resumeSession && selectedAgent === 'grok' ? resumeSession.id : undefined,
+                };
+            let result = await machineSpawnNewSession(spawnOptions);
+            let pendingResults = 0;
+            while (result.type === 'pending' && pendingResults < MAX_RIG_PENDING_RESULTS) {
+                pendingResults += 1;
+                await delay(resolveRigPendingRetryDelayMs(
+                    result.retryAfterMs,
+                    rigCreation?.pendingRetryAfterMs,
+                ));
+                if (!isMountedRef.current) return;
+                result = await machineSpawnNewSession(spawnOptions);
+            }
+            if (!isMountedRef.current) return;
 
             switch (result.type) {
                 case 'success':
+                    // The idempotency key did its job; the next Start is a new session.
+                    completeSpawnRequest();
                     await sync.refreshSessions();
 
                     // Store only per-session overrides. Matching the effective
                     // default stays null so future code default changes apply.
-                    const permissionOverride = currentPermission.key === effectiveAgentDefaults.permissionMode
+                    const permissionOverride = permissionKey === effectiveAgentDefaults.permissionMode
                         ? null
-                        : currentPermission.key;
+                        : permissionKey;
                     const modelOverride = currentModelKey === effectiveAgentDefaults.modelMode
                         ? null
                         : currentModelKey;
@@ -1545,12 +1623,14 @@ function NewSessionScreen() {
                     // Mode picks sync via session metadata (#1492). Nothing to
                     // push when they match the defaults — a fresh session has
                     // no picks in its metadata yet.
-                    const modesPatch: SessionAgentModesPatch = {};
-                    if (permissionOverride !== null) modesPatch.permissionMode = permissionOverride;
-                    if (modelOverride !== null) modesPatch.modelMode = modelOverride;
-                    if (effortOverride !== null) modesPatch.effortLevel = effortOverride;
-                    if (Object.keys(modesPatch).length > 0) {
-                        sessionSetAgentModes(result.sessionId, modesPatch);
+                    if (!rigCreation) {
+                        const modesPatch: SessionAgentModesPatch = {};
+                        if (permissionOverride !== null) modesPatch.permissionMode = permissionOverride;
+                        if (modelOverride !== null) modesPatch.modelMode = modelOverride;
+                        if (effortOverride !== null) modesPatch.effortLevel = effortOverride;
+                        if (Object.keys(modesPatch).length > 0) {
+                            sessionSetAgentModes(result.sessionId, modesPatch);
+                        }
                     }
 
                     // Pull live prompt and clear it. We read via getState() so this
@@ -1578,12 +1658,20 @@ function NewSessionScreen() {
                         { cancelText: t('common.cancel'), confirmText: t('common.create') },
                     );
                     if (approved) {
+                        // The request is unchanged, so the retry resolves to the
+                        // same clientRequestId.
                         await handleSend(true);
                     }
                     break;
                 }
                 case 'error':
                     Modal.alert(t('common.error'), result.errorMessage);
+                    break;
+                case 'pending':
+                    Modal.alert(
+                        t('common.error'),
+                        'Rig created the session, but it is still syncing with Happy. It should appear shortly.',
+                    );
                     break;
             }
         } catch (error) {
@@ -1592,9 +1680,9 @@ function NewSessionScreen() {
                 : 'Failed to start session';
             Modal.alert(t('common.error'), errorMessage);
         } finally {
-            setIsSpawning(false);
+            if (isMountedRef.current) setIsSpawning(false);
         }
-    }, [selectedMachineId, selectedMachine, selectedPath, selectedAgent, router, navigateToSession, currentPermission.key, currentModelKey, currentEffort?.key, effectiveAgentDefaults.permissionMode, effectiveAgentDefaults.modelMode, effectiveAgentDefaults.effortLevel, worktreeKey, resumeSession]);
+    }, [selectedMachineId, selectedMachine, selectedPath, selectedAgent, router, navigateToSession, currentPermission?.key, currentModelKey, currentEffort?.key, effectiveAgentDefaults.permissionMode, effectiveAgentDefaults.modelMode, effectiveAgentDefaults.effortLevel, worktreeKey, rigCreation, supportsWorktree, resumeSession]);
 
     const canSend = selectedMachineId && selectedMachine && isMachineOnline(selectedMachine) && !isSpawning;
     React.useEffect(() => {
@@ -1666,7 +1754,7 @@ function NewSessionScreen() {
                 machineId={selectedMachineId}
                 browseEnabled={!isOffline}
                 onChangeValue={setSelectedPath}
-                onDone={() => setActivePicker(null)}
+                onDone={closePicker}
                 embedded={sidebarLayout.showSidebar}
             />
         ) : pickerData ? (
@@ -1689,6 +1777,7 @@ function NewSessionScreen() {
         );
     }, [
         activePicker,
+        closePicker,
         handlePickerSelect,
         isOffline,
         pathItems,
@@ -1729,7 +1818,7 @@ function NewSessionScreen() {
             machineId={selectedMachineId}
             browseEnabled={!isOffline}
             onChangeValue={setSelectedPath}
-            onDone={() => setActivePicker(null)}
+            onDone={closePicker}
             embedded
         />
     ) : pickerData ? (
@@ -1818,6 +1907,7 @@ function NewSessionScreen() {
                     <>
                         <View style={styles.configRowWithToggle}>
                             <BubblePressable
+                                scaleFeedback={false}
                                 style={(p) => [
                                     styles.configRow,
                                     { flex: 1 },
@@ -1860,6 +1950,7 @@ function NewSessionScreen() {
 
                         <View style={{ opacity: isOffline ? 0.4 : 1 }} pointerEvents={isOffline ? 'none' : 'auto'}>
                             <BubblePressable
+                                scaleFeedback={false}
                                 style={(p) => [styles.configRow, p.pressed && styles.configRowPressed]}
                                 onPress={() => togglePicker('path')}
                             >
@@ -1875,6 +1966,7 @@ function NewSessionScreen() {
                                 <>
                                     <View style={styles.configRow}>
                                         <BubblePressable
+                                            scaleFeedback={false}
                                             onPress={() => togglePicker('agent')}
                                             style={(p) => [styles.configInlineField, p.pressed && styles.configRowPressed]}
                                         >
@@ -1892,9 +1984,9 @@ function NewSessionScreen() {
                                         {showModel && (
                                             <>
                                                 <Text style={[styles.configLabel, { color: theme.colors.textSecondary }]}>·</Text>
-                                                <BubblePressable onPress={() => togglePicker('model')} style={(p) => [styles.configInlineField, p.pressed && styles.configRowPressed]}>
+                                                <BubblePressable scaleFeedback={false} onPress={() => togglePicker('model')} style={(p) => [styles.configInlineField, p.pressed && styles.configRowPressed]}>
                                                     <Text style={[styles.configLabel, styles.configInlineText, { color: theme.colors.textSecondary }]} numberOfLines={1}>
-                                                        {currentModel.name}
+                                                        {currentModel?.name}
                                                     </Text>
                                                     <Ionicons name="chevron-down" size={12} color={theme.colors.textSecondary} />
                                                 </BubblePressable>
@@ -1904,7 +1996,7 @@ function NewSessionScreen() {
                                         {showEffort && (
                                             <>
                                                 <Text style={[styles.configLabel, { color: theme.colors.textSecondary }]}>·</Text>
-                                                <BubblePressable onPress={() => togglePicker('effort')} style={(p) => [styles.configInlineField, p.pressed && styles.configRowPressed]}>
+                                                <BubblePressable scaleFeedback={false} onPress={() => togglePicker('effort')} style={(p) => [styles.configInlineField, p.pressed && styles.configRowPressed]}>
                                                     <Text style={[styles.configLabel, styles.configInlineText, { color: theme.colors.textSecondary }]} numberOfLines={1}>
                                                         {currentEffort?.name}
                                                     </Text>
@@ -1933,6 +2025,7 @@ function NewSessionScreen() {
 
                                     {showPermission && (
                                         <BubblePressable
+                                            scaleFeedback={false}
                                             style={(p) => [styles.configRow, p.pressed && styles.configRowPressed]}
                                             onPress={() => togglePicker('permission')}
                                         >
@@ -1954,6 +2047,7 @@ function NewSessionScreen() {
                             {supportsWorktree && (
                                 <>
                                     <BubblePressable
+                                        scaleFeedback={false}
                                         style={(p) => [styles.configRow, p.pressed && styles.configRowPressed]}
                                         onPress={() => togglePicker('worktree')}
                                     >
@@ -1972,6 +2066,7 @@ function NewSessionScreen() {
                     <>
                         <View style={styles.configRowWithToggle}>
                             <BubblePressable
+                                scaleFeedback={false}
                                 style={(p) => [styles.collapsedRow, { flex: 1 }, p.pressed && styles.configRowPressed]}
                                 onPress={() => togglePicker('path')}
                             >
@@ -2099,10 +2194,16 @@ function NewSessionScreen() {
                         name="arrow-up"
                         size={isNativeMobile ? 18 : 16}
                         color={sendButtonIconColor}
-                        style={[
-                            styles.sendButtonIcon,
-                            { marginTop: Platform.OS === 'web' ? 2 : 0 },
-                        ]}
+                        // The color has to travel in `style`, not just the `color`
+                        // prop: @expo/vector-icons builds `[styleDefaults, style, ...]`
+                        // (create-icon-set.js), so a `style` entry always wins over
+                        // `color`. With styles.sendButtonIcon here — it hardcodes the
+                        // primary tint (white) — the computed color was discarded and
+                        // the arrow painted white on the near-white glass composer.
+                        style={{
+                            color: sendButtonIconColor,
+                            marginTop: Platform.OS === 'web' ? 2 : 0,
+                        }}
                     />
                 )}
             </Pressable>
@@ -2138,6 +2239,7 @@ function NewSessionScreen() {
                 {isNativeMobile && (
                     <View style={styles.mobileComposerLeftControls}>
                         <BubblePressable
+                            scaleFeedback={false}
                             onPress={() => togglePicker('agent')}
                             style={(pressedState) => [
                                 styles.composerAgentButton,
@@ -2229,19 +2331,12 @@ function NewSessionScreen() {
                 />
             )}
 
-            {isNativeMobile && activePicker && (
-                <AnimatedClickAwayBackdrop
-                    onPress={() => setActivePicker(null)}
-                    style={styles.nativePickerBackdrop}
-                />
-            )}
-
             {sidebarLayout.showSidebar ? (
                 <View style={styles.desktopShell}>
                     {Platform.OS === 'web' && activePicker && (
                         <Pressable
                             style={styles.clickAwayBackdrop}
-                            onPress={() => setActivePicker(null)}
+                            onPress={closePicker}
                         />
                     )}
                     <View style={styles.desktopMain}>
@@ -2268,6 +2363,13 @@ function NewSessionScreen() {
                 </View>
             ) : (
                 <View style={styles.inner}>
+                    {isNativeMobile && activePicker && (
+                        <AnimatedClickAwayBackdrop
+                            exitImmediately
+                            onPress={closePicker}
+                            style={styles.nativePickerBackdrop}
+                        />
+                    )}
                     {isNativeMobile ? (
                         <>
                             <ScrollView
@@ -2275,11 +2377,17 @@ function NewSessionScreen() {
                                 contentContainerStyle={styles.mobileConfigScrollContent}
                                 keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
                                 keyboardShouldPersistTaps="handled"
-                                onScrollBeginDrag={Keyboard.dismiss}
+                                onScrollBeginDrag={() => {
+                                    Keyboard.dismiss();
+                                    closePicker();
+                                }}
                                 showsVerticalScrollIndicator={false}
                             >
                                 <Pressable
-                                    onPress={Keyboard.dismiss}
+                                    onPress={() => {
+                                        Keyboard.dismiss();
+                                        closePicker();
+                                    }}
                                     style={styles.mobileKeyboardDismissArea}
                                 >
                                     <View
@@ -2307,7 +2415,7 @@ function NewSessionScreen() {
                             {Platform.OS === 'web' && activePicker && (
                                 <Pressable
                                     style={styles.clickAwayBackdropBehind}
-                                    onPress={() => setActivePicker(null)}
+                                    onPress={closePicker}
                                 />
                             )}
                             <View style={{ flex: 1 }} />
@@ -2329,7 +2437,7 @@ function NewSessionScreen() {
                         { top: nativePickerTop },
                     ]}
                 >
-                    <AnimatedPopup>
+                    <AnimatedPopup exitImmediately>
                         <LocalBlurHalo borderRadius={24} />
                         <MobileGlassSurface
                             nativeEffect
@@ -2362,7 +2470,7 @@ function NewSessionScreen() {
             {Platform.OS !== 'web' && !isNativeMobile && (
                 <BottomSheet
                     visible={!!activePicker}
-                    onClose={() => setActivePicker(null)}
+                    onClose={closePicker}
                 >
                     {activePicker === 'path' ? (
                         <PathPickerContent
@@ -2373,7 +2481,7 @@ function NewSessionScreen() {
                             machineId={selectedMachineId}
                             browseEnabled={!isOffline}
                             onChangeValue={setSelectedPath}
-                            onDone={() => setActivePicker(null)}
+                            onDone={closePicker}
                         />
                     ) : pickerData ? (
                         <PickerContent {...pickerData} onSelect={handlePickerSelect} />
@@ -2465,10 +2573,11 @@ const styles = StyleSheet.create((theme) => ({
         paddingHorizontal: 20,
         paddingTop: 0,
         paddingBottom: 8,
-        zIndex: 20,
+        zIndex: NEW_SESSION_PICKER_LAYERS.config,
     },
     mobileConfigScroll: {
         flex: 1,
+        zIndex: NEW_SESSION_PICKER_LAYERS.config,
     },
     mobileConfigScrollContent: {
         flexGrow: 1,
@@ -2494,7 +2603,7 @@ const styles = StyleSheet.create((theme) => ({
         shadowOpacity: 1,
         shadowRadius: 24,
         elevation: 8,
-        zIndex: 10,
+        zIndex: NEW_SESSION_PICKER_LAYERS.composer,
     },
     mobileHeaderTitle: {
         fontSize: 16,
@@ -2518,7 +2627,7 @@ const styles = StyleSheet.create((theme) => ({
         zIndex: 1,
     },
     nativePickerBackdrop: {
-        zIndex: 150,
+        zIndex: NEW_SESSION_PICKER_LAYERS.backdrop,
     },
     clickAwayBackdropBehind: {
         position: 'absolute',
@@ -2576,7 +2685,7 @@ const styles = StyleSheet.create((theme) => ({
         position: 'absolute',
         left: 20,
         right: 20,
-        zIndex: 151,
+        zIndex: NEW_SESSION_PICKER_LAYERS.popup,
     },
     nativePopoverSurface: {
         width: '100%',
@@ -2816,7 +2925,12 @@ const styles = StyleSheet.create((theme) => ({
         marginLeft: 0,
         backgroundColor: Platform.select({
             ios: 'transparent',
-            android: theme.colors.glass.backgroundStrong,
+            // mobileInputBox — the composer panel directly behind this button —
+            // is itself painted glass.backgroundStrong, so reusing that token
+            // here gave the button the exact same color as its parent and the
+            // send affordance vanished into the panel. iOS stays transparent
+            // because the real glass material renders there.
+            android: theme.colors.surfaceHighest,
             default: 'transparent',
         }),
         borderWidth: StyleSheet.hairlineWidth,
@@ -2837,9 +2951,6 @@ const styles = StyleSheet.create((theme) => ({
     },
     sendButtonInnerPressed: {
         opacity: 0.7,
-    },
-    sendButtonIcon: {
-        color: theme.colors.button.primary.tint,
     },
     offlineHelp: {
         flexDirection: 'row',

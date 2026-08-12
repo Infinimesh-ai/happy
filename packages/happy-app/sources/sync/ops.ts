@@ -6,7 +6,7 @@
 import { sessionRPC, machineRPC, legacyRequest, legacyEmitWithAck } from './transport/transport';
 import { sync } from './sync';
 import { storage } from './storage';
-import type { MachineMetadata, SessionAgentModesPatch } from './storageTypes';
+import type { AgentQuestionAnswer, MachineMetadata, SessionAgentModesPatch } from './storageTypes';
 import { markAgentModePushPending, clearAgentModePushPending, type AgentModeField } from './agentModesPending';
 import {
     isRigMetadata,
@@ -31,6 +31,19 @@ interface SessionPermissionRequest {
     allowTools?: string[];
     updatedInput?: Record<string, unknown>;
     decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort';
+}
+
+/**
+ * Reply to an agent-to-user communication. Separate from the permission channel
+ * on purpose: nothing here approves or denies an action, it carries information
+ * the agent asked for. `kind` mirrors the request so the agent can route the
+ * reply once other kinds of communication exist.
+ */
+interface SessionCommunicationReply {
+    id: string;
+    kind: string;
+    status: 'answered' | 'cancelled';
+    answers?: Record<string, AgentQuestionAnswer>;
 }
 
 // Mode change operation types
@@ -148,6 +161,7 @@ interface SessionKillResponse {
 // Response types for spawn session
 export type SpawnSessionResult =
     | { type: 'success'; sessionId: string }
+    | { type: 'pending'; clientRequestId: string; retryAfterMs: number }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
     | { type: 'error'; errorMessage: string };
 
@@ -157,10 +171,16 @@ export interface SpawnSessionOptions {
     directory: string;
     approvedNewDirectoryCreation?: boolean;
     token?: string;
-    agent?: 'codex' | 'claude' | 'gemini' | 'grok' | 'openclaw' | 'agy';
+    agent?: 'codex' | 'claude' | 'gemini' | 'grok' | 'openclaw' | 'agy' | 'rig';
     permissionMode?: string;
     modelMode?: string;
     effortLevel?: string;
+    /** Stable idempotency key required by Rig's machine RPC. */
+    clientRequestId?: string;
+    /** Rig-native provider/model selection. */
+    providerId?: string;
+    modelId?: string;
+    effort?: string;
     /**
      * If set, the daemon spawns the agent with `--resume <id>` so the new
      * Happy session attaches to a pre-existing on-disk Claude conversation
@@ -242,28 +262,49 @@ export interface ResumeSessionOptions {
  */
 export async function machineSpawnNewSession(options: SpawnSessionOptions): Promise<SpawnSessionResult> {
 
-    const { machineId, directory, approvedNewDirectoryCreation = false, token, agent, permissionMode, modelMode, effortLevel, resumeClaudeSessionId, resumeCodexThreadId, resumeGrokSessionId, parentSessionId, forkedFromMessageId, isSideChat } = options;
+    const { machineId, directory, approvedNewDirectoryCreation = false, token, agent, permissionMode, modelMode, effortLevel, clientRequestId, providerId, modelId, effort, resumeClaudeSessionId, resumeCodexThreadId, resumeGrokSessionId, parentSessionId, forkedFromMessageId, isSideChat } = options;
 
     try {
-        const result = await machineRPC<SpawnSessionResult, {
+        if (agent === 'rig' && !clientRequestId) {
+            throw new Error('Rig session creation requires a client request ID');
+        }
+        type SpawnRequest = {
             type: 'spawn-in-directory'
             directory: string
             approvedNewDirectoryCreation?: boolean,
             token?: string,
-            agent?: 'codex' | 'claude' | 'gemini' | 'grok' | 'openclaw' | 'agy',
+            agent?: 'codex' | 'claude' | 'gemini' | 'grok' | 'openclaw' | 'agy' | 'rig',
             permissionMode?: string,
             modelMode?: string,
             effortLevel?: string,
+            clientRequestId?: string,
+            providerId?: string,
+            modelId?: string,
+            effort?: string,
             resumeClaudeSessionId?: string,
             resumeCodexThreadId?: string,
             resumeGrokSessionId?: string,
             parentSessionId?: string,
             forkedFromMessageId?: string,
             isSideChat?: boolean,
-        }>(
+        };
+        const request: SpawnRequest = agent === 'rig'
+            ? {
+                type: 'spawn-in-directory',
+                agent: 'rig',
+                directory,
+                approvedNewDirectoryCreation,
+                ...(clientRequestId ? { clientRequestId } : {}),
+                ...(permissionMode ? { permissionMode } : {}),
+                ...(providerId ? { providerId } : {}),
+                ...(modelId ? { modelId } : {}),
+                ...((effort ?? effortLevel) ? { effort: effort ?? effortLevel } : {}),
+            }
+            : { type: 'spawn-in-directory', directory, approvedNewDirectoryCreation, token, agent, permissionMode, modelMode, effortLevel, resumeClaudeSessionId, resumeCodexThreadId, resumeGrokSessionId, parentSessionId, forkedFromMessageId, isSideChat };
+        const result = await machineRPC<SpawnSessionResult, SpawnRequest>(
             machineId,
             'spawn-happy-session',
-            { type: 'spawn-in-directory', directory, approvedNewDirectoryCreation, token, agent, permissionMode, modelMode, effortLevel, resumeClaudeSessionId, resumeCodexThreadId, resumeGrokSessionId, parentSessionId, forkedFromMessageId, isSideChat }
+            request,
         );
         return result;
     } catch (error) {
@@ -793,6 +834,32 @@ export async function sessionAbort(sessionId: string): Promise<void> {
 export async function sessionAllow(sessionId: string, id: string, mode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan', allowedTools?: string[], decision?: 'approved' | 'approved_for_session', updatedInput?: Record<string, unknown>): Promise<void> {
     const request: SessionPermissionRequest = { id, approved: true, mode, allowTools: allowedTools, decision, updatedInput };
     await sessionRPC(sessionId, 'permission', request);
+}
+
+/**
+ * Answer a question the agent asked. The reply carries back the same `kind` the
+ * agent published, so the agent can route it without guessing.
+ */
+export async function sessionAnswerQuestion(
+    sessionId: string,
+    id: string,
+    answers: Record<string, AgentQuestionAnswer>,
+    kind: string = 'form',
+): Promise<void> {
+    const reply: SessionCommunicationReply = { id, kind, status: 'answered', answers };
+    await sessionRPC(sessionId, 'communication', reply);
+}
+
+/**
+ * Dismiss a communication without answering it.
+ */
+export async function sessionCancelCommunication(
+    sessionId: string,
+    id: string,
+    kind: string = 'form',
+): Promise<void> {
+    const reply: SessionCommunicationReply = { id, kind, status: 'cancelled' };
+    await sessionRPC(sessionId, 'communication', reply);
 }
 
 /**

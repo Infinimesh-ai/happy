@@ -306,6 +306,8 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 return;
             }
 
+            activityCache.clearSessionUpdates(sid);
+
             // Update last active at
             await db.session.update({
                 where: { id: sid },

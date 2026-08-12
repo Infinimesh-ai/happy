@@ -13,6 +13,7 @@ import type { DecryptedMachine, DecryptedSession } from './api';
 import { resumeSessionOnMachine, spawnSessionOnMachine, type SupportedAgent } from './machineRpc';
 import { SessionClient } from './session';
 import { formatMachineTable, formatSessionTable, formatSessionStatus, formatMessageHistory, formatJson } from './output';
+import { createDefaultDeps, loadOrCreateBridgeToken, startBridgeMcpServer } from './mcp';
 
 // --- Helpers ---
 
@@ -500,6 +501,48 @@ program
         } finally {
             client.close();
         }
+    });
+
+program
+    .command('mcp')
+    .description('Run the personal bridge MCP server (Streamable HTTP) for external assistants')
+    .option('--host <host>', 'Bind address', '127.0.0.1')
+    .option('--port <port>', 'Port to listen on', (v: string) => {
+        const n = parseInt(v, 10);
+        if (isNaN(n) || n < 0 || n > 65535) throw new Error('--port must be 0-65535');
+        return n;
+    }, 8790)
+    .option('--no-auth', 'Disable bearer token auth (only safe strictly on loopback)')
+    .action(async (opts: { host: string; port: number; auth: boolean }) => {
+        const config = loadConfig();
+        const creds = requireCredentials(config);
+        const authToken = opts.auth ? loadOrCreateBridgeToken(config) : null;
+        const handle = await startBridgeMcpServer({
+            host: opts.host,
+            port: opts.port,
+            authToken,
+            deps: createDefaultDeps(config, creds),
+        });
+
+        console.log([
+            '## Happy Bridge MCP',
+            '',
+            `- Endpoint: ${handle.url}`,
+            `- Transport: Streamable HTTP (stateless)`,
+            authToken
+                ? `- Authorization: Bearer token in ${join(config.homeDir, 'mcp.token')}`
+                : '- Authorization: DISABLED (--no-auth)',
+            '',
+            'Configure this endpoint in your MCP client. Press Ctrl+C to stop.',
+        ].join('\n'));
+
+        await new Promise<void>(resolve => {
+            const shutdown = () => {
+                handle.close().finally(resolve);
+            };
+            process.once('SIGINT', shutdown);
+            process.once('SIGTERM', shutdown);
+        });
     });
 
 program.parseAsync(process.argv).catch(err => {

@@ -26,6 +26,7 @@ const flavorIcons = {
     grok: require('@/assets/images/icon-grok.png'),
     openclaw: require('@/assets/images/icon-openclaw.png'),
     rig: require('@/assets/images/icon-rig.png'),
+    agy: require('@/assets/images/icon-agy.png'),
 };
 
 const styles = StyleSheet.create((theme) => ({

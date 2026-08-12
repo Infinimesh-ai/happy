@@ -3,10 +3,12 @@ import { View, Pressable, FlatList, NativeScrollEvent, NativeSyntheticEvent, Pla
 import { Text } from '@/components/StyledText';
 import { usePathname } from 'expo-router';
 import { SessionListViewItem, SessionRowData } from '@/sync/storage';
+import { filterProjectGroup, sessionMatchesQuery } from '@/sync/projectGroups';
 import { Ionicons } from '@expo/vector-icons';
 import { type SessionState, formatLastSeen, vibingMessages } from '@/utils/sessionUtils';
 import { Avatar } from './Avatar';
 import { ActiveSessionsGroupCompact } from './ActiveSessionsGroupCompact';
+import { ProjectGroup } from './ProjectGroup';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useVisibleSessionListViewData } from '@/hooks/useVisibleSessionListViewData';
 import { Typography } from '@/constants/Typography';
@@ -19,7 +21,6 @@ import { layout } from './layout';
 import { useNavigateToSession } from '@/hooks/useNavigateToSession';
 import { SessionActionsAnchor, SessionActionsPopover } from './SessionActionsPopover';
 import { useSessionActionAlert } from '@/hooks/useSessionQuickActions';
-import { useSettingMutable } from '@/sync/storage';
 import { t } from '@/text';
 import { SessionShortcutHintBadge } from './ShortcutHints';
 import { ProviderIcon } from './ProviderIcon';
@@ -185,24 +186,6 @@ const stylesheet = StyleSheet.create((theme) => ({
         paddingBottom: 12,
         backgroundColor: Platform.select({ web: theme.colors.groupped.background, default: 'transparent' }),
     },
-    archiveToggle: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        paddingHorizontal: 24,
-        paddingVertical: 16,
-    },
-    archiveToggleLine: {
-        flex: 1,
-        height: StyleSheet.hairlineWidth,
-        backgroundColor: theme.colors.groupped.sectionTitle,
-        opacity: 0.3,
-    },
-    archiveToggleText: {
-        fontSize: 12,
-        color: theme.colors.textSecondary,
-        paddingHorizontal: 12,
-        ...Typography.default('semiBold'),
-    },
 }));
 
 export function SessionsList({
@@ -221,10 +204,6 @@ export function SessionsList({
     const sourceData = useVisibleSessionListViewData();
     const pathname = usePathname();
     const isTablet = useIsTablet();
-    const [hideInactiveSessions, setHideInactiveSessions] = useSettingMutable('hideInactiveSessions');
-    const toggleArchived = React.useCallback(() => {
-        setHideInactiveSessions(!hideInactiveSessions);
-    }, [hideInactiveSessions, setHideInactiveSessions]);
     // Selection is derived once from pathname so the data array stays stable
     // across navigations. This keeps FlatList virtualization intact: only
     // the previously- and newly-selected rows re-render, instead of the
@@ -248,13 +227,20 @@ export function SessionsList({
             return sourceData;
         }
 
-        const matches = (session: SessionRowData) => [
-            session.name,
-            session.subtitle,
-            session.path,
-            session.machineId,
-            session.flavor,
-        ].some((value) => value?.toLocaleLowerCase().includes(normalizedQuery));
+        const matches = (session: SessionRowData) => sessionMatchesQuery(session, normalizedQuery);
+
+        // Projects nest their sessions inside worktrees, so they need a pass of
+        // their own: the index walk below only ever sees flat `session` items.
+        const keptProjects = new Map<number, SessionListViewItem>();
+        const keptProjectSources = new Set<'rig' | 'happy'>();
+        sourceData.forEach((item, index) => {
+            if (item.type !== 'project') return;
+            const project = filterProjectGroup(item.project, normalizedQuery);
+            if (project) {
+                keptProjects.set(index, { ...item, project });
+                keptProjectSources.add(item.source);
+            }
+        });
 
         const keepIndices = new Set<number>();
         let currentHeaderIndex: number | null = null;
@@ -284,6 +270,15 @@ export function SessionsList({
                 if (sessions.length > 0) result.push({ ...item, sessions });
                 return;
             }
+            if (item.type === 'projects-header') {
+                if (keptProjectSources.has(item.source)) result.push(item);
+                return;
+            }
+            if (item.type === 'project') {
+                const kept = keptProjects.get(index);
+                if (kept) result.push(kept);
+                return;
+            }
             if (keepIndices.has(index)) result.push(item);
         });
         return result;
@@ -300,8 +295,9 @@ export function SessionsList({
         switch (item.type) {
             case 'header': return `header-${item.title}-${index}`;
             case 'active-sessions': return 'active-sessions';
-            case 'archive-toggle': return 'archive-toggle';
             case 'project-group': return `project-group-${item.machine.id}-${item.displayPath}-${index}`;
+            case 'projects-header': return `projects-header-${item.source}`;
+            case 'project': return `project-${item.project.id}`;
             case 'session': return `session-${item.session.id}`;
         }
     }, []);
@@ -317,21 +313,27 @@ export function SessionsList({
                     </View>
                 );
 
-            case 'archive-toggle':
-                return (
-                    <Pressable style={styles.archiveToggle} onPress={toggleArchived}>
-                        <View style={styles.archiveToggleLine} />
-                        <Text style={styles.archiveToggleText}>
-                            {item.hidden ? t('sidebar.showArchived') : t('sidebar.hideArchived')}
-                        </Text>
-                        <View style={styles.archiveToggleLine} />
-                    </Pressable>
-                );
-
             case 'active-sessions':
                 return (
                     <ActiveSessionsGroupCompact
                         sessions={item.sessions}
+                        selectedSessionId={selectedSessionId}
+                    />
+                );
+
+            case 'projects-header':
+                return (
+                    <View style={styles.headerSection}>
+                        <Text style={styles.headerText}>
+                            {item.source === 'rig' ? 'Rig' : t('sidebar.sessionsTitle')}
+                        </Text>
+                    </View>
+                );
+
+            case 'project':
+                return (
+                    <ProjectGroup
+                        project={item.project}
                         selectedSessionId={selectedSessionId}
                     />
                 );
@@ -368,7 +370,7 @@ export function SessionsList({
                     />
                 );
         }
-    }, [selectedSessionId, data, toggleArchived]);
+    }, [selectedSessionId, data]);
 
 
     // Remove this section as we'll use FlatList for all items now

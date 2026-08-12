@@ -26,12 +26,17 @@ function session(
         createdAt,
         hasDraft: false,
         active: true,
+        archived: false,
         machineId,
         path,
         homeDir: null,
         completedTodosCount: 0,
         totalTodosCount: 0,
         hasUnread: false,
+        projectId: null,
+        projectName: null,
+        workspaceId: null,
+        workspaceName: null,
     };
 }
 
@@ -67,7 +72,6 @@ describe('session display order', () => {
         }));
         const data: SessionListViewItem[] = [
             { type: 'active-sessions', sessions: activeSessions },
-            { type: 'archive-toggle', hidden: false },
             ...inactiveSessions,
         ];
 
@@ -81,6 +85,50 @@ describe('session display order', () => {
             'inactive-4',
             'inactive-5',
             'inactive-6',
+        ]);
+    });
+
+    it('numbers sessions nested in the shared project-card layout', () => {
+        const data: SessionListViewItem[] = [
+            { type: 'projects-header', source: 'rig' },
+            {
+                type: 'project',
+                source: 'rig',
+                project: {
+                    id: 'rig-project',
+                    name: 'rig',
+                    machineId: 'machine-a',
+                    activeCount: 1,
+                    sessionCount: 1,
+                    workspaces: [{
+                        id: '',
+                        name: null,
+                        sessions: [session('rig-session', 'machine-a', '/rig')],
+                    }],
+                },
+            },
+            { type: 'projects-header', source: 'happy' },
+            {
+                type: 'project',
+                source: 'happy',
+                project: {
+                    id: 'happy-project',
+                    name: 'happy',
+                    machineId: 'machine-a',
+                    activeCount: 1,
+                    sessionCount: 1,
+                    workspaces: [{
+                        id: '',
+                        name: null,
+                        sessions: [session('happy-session', 'machine-a', '/happy')],
+                    }],
+                },
+            },
+        ];
+
+        expect(getSessionShortcutIdsInDisplayOrder(data, machines, 'Unknown')).toEqual([
+            'rig-session',
+            'happy-session',
         ]);
     });
 });

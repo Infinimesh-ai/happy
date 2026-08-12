@@ -12,8 +12,8 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
-import { useFriendRequests, useSocketStatus, useRealtimeStatus } from '@/sync/storage';
-import { useVisibleSessionListViewData } from '@/hooks/useVisibleSessionListViewData';
+import { useFriendRequests, useSocketStatus, useRealtimeStatus, useSettingMutable } from '@/sync/storage';
+import { useHasArchivedSessions, useVisibleSessionListViewData } from '@/hooks/useVisibleSessionListViewData';
 import { useIsTablet } from '@/utils/responsive';
 import { useRouter } from 'expo-router';
 import { EmptySessionsTablet } from './EmptySessionsTablet';
@@ -33,7 +33,6 @@ import { t } from '@/text';
 import { isUsingCustomServer } from '@/sync/serverConfig';
 import { trackFriendsSearch } from '@/track';
 import { MOBILE_GLASS_HEADER_HEIGHT } from './navigation/headerMetrics';
-import { MobileGlassSurface } from './MobileGlass';
 import { useNewSessionDraft } from '@/hooks/useNewSessionDraft';
 import { useStartSessionFromDraft } from '@/hooks/useStartSessionFromDraft';
 
@@ -145,19 +144,19 @@ const styles = StyleSheet.create((theme) => ({
     headerActions: {
         flexDirection: 'row',
         alignItems: 'center',
-        gap: 8,
-    },
-    headerActionGlass: {
-        width: 40,
-        height: 40,
-        borderRadius: 20,
-        overflow: 'hidden',
     },
     headerActionButton: {
-        width: '100%',
-        height: '100%',
+        width: 44,
+        height: 44,
         alignItems: 'center',
         justifyContent: 'center',
+    },
+    headerActionButtonActive: {
+        width: 36,
+        height: 36,
+        marginHorizontal: 4,
+        borderRadius: 12,
+        backgroundColor: theme.colors.surfaceSelected,
     },
     headerSearch: {
         width: '100%',
@@ -283,10 +282,16 @@ const HeaderRight = React.memo(({
     activeTab,
     searchActive,
     onSearchPress,
+    hasArchivedSessions,
+    hideArchivedSessions,
+    onArchiveVisibilityPress,
 }: {
     activeTab: ActiveTabType;
     searchActive: boolean;
     onSearchPress: () => void;
+    hasArchivedSessions: boolean;
+    hideArchivedSessions: boolean;
+    onArchiveVisibilityPress: () => void;
 }) => {
     const router = useRouter();
     const { theme } = useUnistyles();
@@ -296,39 +301,79 @@ const HeaderRight = React.memo(({
         if (Platform.OS !== 'web') {
             return (
                 <View style={styles.headerActions}>
-                    <MobileGlassSurface nativeEffect interactive style={styles.headerActionGlass}>
+                    <Pressable
+                        onPress={onSearchPress}
+                        accessibilityLabel={t('tools.names.search')}
+                        accessibilityRole="button"
+                        style={styles.headerActionButton}
+                    >
+                        <Ionicons
+                            name={searchActive ? 'close' : 'search'}
+                            size={searchActive ? 24 : 21}
+                            color={theme.colors.header.tint}
+                        />
+                    </Pressable>
+                    {hasArchivedSessions && !searchActive && (
                         <Pressable
-                            onPress={onSearchPress}
-                            style={styles.headerActionButton}
-                            hitSlop={8}
+                            onPress={onArchiveVisibilityPress}
+                            accessibilityLabel={hideArchivedSessions
+                                ? t('sidebar.showArchived')
+                                : t('sidebar.hideArchived')}
+                            accessibilityRole="button"
+                            accessibilityState={{ selected: !hideArchivedSessions }}
+                            style={[
+                                styles.headerActionButton,
+                                !hideArchivedSessions && styles.headerActionButtonActive,
+                            ]}
                         >
                             <Ionicons
-                                name={searchActive ? 'close' : 'search'}
-                                size={searchActive ? 24 : 21}
+                                name={hideArchivedSessions ? 'archive-outline' : 'archive'}
+                                size={20}
                                 color={theme.colors.header.tint}
                             />
                         </Pressable>
-                    </MobileGlassSurface>
-                    <MobileGlassSurface nativeEffect interactive style={styles.headerActionGlass}>
-                        <Pressable
-                            onPress={() => router.push('/settings')}
-                            style={styles.headerActionButton}
-                            hitSlop={8}
-                        >
-                            <Ionicons name="settings-outline" size={21} color={theme.colors.header.tint} />
-                        </Pressable>
-                    </MobileGlassSurface>
+                    )}
+                    <Pressable
+                        onPress={() => router.push('/settings')}
+                        accessibilityLabel={t('settings.title')}
+                        accessibilityRole="button"
+                        style={styles.headerActionButton}
+                    >
+                        <Ionicons name="settings-outline" size={21} color={theme.colors.header.tint} />
+                    </Pressable>
                 </View>
             );
         }
         return (
-            <Pressable
-                onPress={() => router.navigate('/new')}
-                hitSlop={15}
-                style={styles.headerButton}
-            >
-                <Ionicons name="add-outline" size={28} color={theme.colors.header.tint} />
-            </Pressable>
+            <View style={styles.headerActions}>
+                {hasArchivedSessions && (
+                    <Pressable
+                        onPress={onArchiveVisibilityPress}
+                        accessibilityLabel={hideArchivedSessions
+                            ? t('sidebar.showArchived')
+                            : t('sidebar.hideArchived')}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected: !hideArchivedSessions }}
+                        style={[
+                            styles.headerButton,
+                            !hideArchivedSessions && styles.headerActionButtonActive,
+                        ]}
+                    >
+                        <Ionicons
+                            name={hideArchivedSessions ? 'archive-outline' : 'archive'}
+                            size={19}
+                            color={theme.colors.header.tint}
+                        />
+                    </Pressable>
+                )}
+                <Pressable
+                    onPress={() => router.navigate('/new')}
+                    hitSlop={15}
+                    style={styles.headerButton}
+                >
+                    <Ionicons name="add-outline" size={28} color={theme.colors.header.tint} />
+                </Pressable>
+            </View>
         );
     }
 
@@ -368,6 +413,10 @@ const HeaderRight = React.memo(({
 export const MainView = React.memo(({ variant }: MainViewProps) => {
     const { theme } = useUnistyles();
     const sessionListViewData = useVisibleSessionListViewData();
+    const hasArchivedSessions = useHasArchivedSessions();
+    // Stored under its original `hideInactiveSessions` key — synced settings
+    // have no rename migration — but it hides archived sessions only.
+    const [hideArchivedSessions, setHideArchivedSessions] = useSettingMutable('hideInactiveSessions');
     const isTablet = useIsTablet();
     const router = useRouter();
     const friendRequests = useFriendRequests();
@@ -416,6 +465,10 @@ export const MainView = React.memo(({ variant }: MainViewProps) => {
             return !currentValue;
         });
     }, []);
+
+    const handleArchiveVisibilityPress = React.useCallback(() => {
+        setHideArchivedSessions(!hideArchivedSessions);
+    }, [hideArchivedSessions, setHideArchivedSessions]);
 
     const handleTabPress = React.useCallback((tab: ActiveTabType) => {
         // This callback is intentionally independent of activeTab. Gesture
@@ -499,14 +552,19 @@ export const MainView = React.memo(({ variant }: MainViewProps) => {
                         activeTab={activeTab}
                         searchActive={searchActive}
                         onSearchPress={handleSearchPress}
+                        hasArchivedSessions={hasArchivedSessions}
+                        hideArchivedSessions={hideArchivedSessions}
+                        onArchiveVisibilityPress={handleArchiveVisibilityPress}
                     />
                 ) : undefined}
-                headerRightGlass={false}
                 headerLeft={() => <HeaderLogo />}
                 headerLeftGlass={Platform.OS !== 'web'}
                 headerBackdropVisible={headerBackdropVisible}
+                headerBackdropAlwaysVisible={Platform.OS !== 'web'}
+                headerBackdropVariant="strong"
                 headerShadowVisible={false}
                 headerTransparent={true}
+                mobileTitleSurface="plain"
             />
             {realtimeStatus !== 'disconnected' && (
                 <VoiceAssistantStatusBar variant="full" />
@@ -544,6 +602,7 @@ export const MainView = React.memo(({ variant }: MainViewProps) => {
                             onPromptChange={setHomePrompt}
                             onSubmit={handleHomePromptSubmit}
                             isSubmitting={isStartingHomeSession}
+                            showBottomBackdrop={sessionListViewData !== null && sessionListViewData.length > 0}
                         />
                     )}
                 </View>

@@ -8,9 +8,9 @@
 
 import { chacha20poly1305 } from '@noble/ciphers/chacha';
 import { ed25519, x25519 } from '@noble/curves/ed25519';
-import { hkdf } from '@noble/hashes/hkdf';
-import { hmac } from '@noble/hashes/hmac';
-import { sha256 } from '@noble/hashes/sha2';
+import { hkdf } from '@noble/hashes/hkdf.js';
+import { hmac } from '@noble/hashes/hmac.js';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 import { IscpErrorCodes, iscpError } from '../errors';
 import {

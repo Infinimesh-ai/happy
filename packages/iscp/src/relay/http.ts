@@ -16,8 +16,10 @@ import type { CryptoProvider } from '../crypto/provider';
 import {
   DeliveryReceiptSchema,
   SignedDescriptorSchema,
+  TrustGrantSchema,
   type DeliveryReceipt,
   type DeviceProof,
+  type PairingTicket,
   type SecureEnvelope,
   type SignedDescriptor,
 } from '../schemas';
@@ -39,6 +41,30 @@ export const RelayCredentialPairSchema = z.object({
 });
 export type RelayCredentialPair = z.infer<typeof RelayCredentialPairSchema>;
 
+/** Device registry record returned by the Cloud's managed registration (`data`). */
+export const RegisteredDeviceSchema = z.looseObject({
+  device_id: z.string().min(1),
+  domain_id: z.string().min(1),
+  device_type: z.string().optional(),
+  device_role: z.string().optional(),
+  display_name: z.string().optional(),
+  public_key_thumbprint: z.string().optional(),
+});
+export type RegisteredDevice = z.infer<typeof RegisteredDeviceSchema>;
+
+/**
+ * 201 response of the v2 signed-ticket registration
+ * (InfinimeshCloud docs/10-design/12-managed-provisioning.md): the official
+ * device record, both relay credentials, and the pre-authorized Trust Grant.
+ */
+export const SignedTicketRegistrationSchema = z.object({
+  data: RegisteredDeviceSchema,
+  access: RelayCredentialSchema,
+  refresh: RelayCredentialSchema,
+  grant: TrustGrantSchema,
+});
+export type SignedTicketRegistration = z.infer<typeof SignedTicketRegistrationSchema>;
+
 export type FetchLike = (url: string, init?: {
   method?: string;
   headers?: Record<string, string>;
@@ -56,6 +82,17 @@ async function parseError(response: { status: number; json(): Promise<unknown>; 
     wire = await response.json();
   } catch {
     wire = undefined;
+  }
+  // Infinimesh Cloud error envelope: { error: { code, message, reason, request_id } }.
+  // Surface the stable machine reason (ticket_consumed, device_proof_invalid, ...)
+  // so callers can react without string-matching human messages.
+  if (typeof wire === 'object' && wire !== null && typeof (wire as { error?: unknown }).error === 'object') {
+    const err = (wire as { error: Record<string, unknown> }).error;
+    if (typeof err.message === 'string' && typeof err.reason === 'string') {
+      throw iscpError(IscpErrorCodes.AccessInvalid, `${context} failed with status ${response.status}: ${err.message} (${err.reason})`, {
+        details: { reason: err.reason, ...(typeof err.code === 'string' ? { code: err.code } : {}) },
+      });
+    }
   }
   throw iscpErrorFromWire(wire, `${context} failed with status ${response.status}`);
 }
@@ -109,6 +146,61 @@ export class RelayHttpClient {
       identity: device.identity,
       proof,
     });
+  }
+
+  /**
+   * POST /v2/relay/devices/register-with-ticket — Infinimesh Cloud managed
+   * provisioning (v2 signed-ticket contract, OPS 2026-08-16 §5.5).
+   *
+   * Sends the full signed ticket, the submitted identity, and a possession
+   * proof bound to this relay with `challenge = ticket.ticket_id` (±5 min
+   * server window, nonce replay-gated). The enrollee shape (device_type/role)
+   * is fixed server-side; this client intentionally sends neither. An
+   * `Idempotency-Key` header is generated once and reused on the automatic
+   * network-failure retry so an interrupted first attempt is replayed, not
+   * double-consumed.
+   */
+  async registerWithSignedTicket(
+    device: Device,
+    ticket: PairingTicket,
+    opts?: { displayName?: string; metadata?: Record<string, unknown>; idempotencyKey?: string },
+  ): Promise<SignedTicketRegistration> {
+    const proof = createDeviceProof(this.provider, device, {
+      audience: this.relayId,
+      challenge: ticket.ticket_id,
+      now: this.now(),
+    });
+    const path = '/v2/relay/devices/register-with-ticket';
+    const body = JSON.stringify({
+      ticket,
+      identity: device.identity,
+      identity_proof: proof,
+      ...(opts?.displayName !== undefined ? { display_name: opts.displayName } : {}),
+      ...(opts?.metadata !== undefined ? { metadata: opts.metadata } : {}),
+    });
+    const headers = {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': opts?.idempotencyKey ?? toBase64Url(this.provider.randomBytes(18)),
+    };
+    let response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${path}`, { method: 'POST', headers, body });
+    } catch {
+      // Network interruption: retry once with the identical body and
+      // Idempotency-Key — if the first request landed, the Cloud replays the
+      // stored response instead of consuming the ticket again.
+      response = await this.fetchImpl(`${this.baseUrl}${path}`, { method: 'POST', headers, body });
+    }
+    if (!response.ok) await parseError(response, 'signed-ticket registration');
+    const raw = (await response.json()) as { grant?: unknown };
+    if (raw === null || typeof raw !== 'object' || raw.grant === undefined) {
+      throw iscpError(IscpErrorCodes.TrustInvalid, 'signed-ticket registration did not return a trust grant');
+    }
+    const parsed = SignedTicketRegistrationSchema.parse(raw);
+    if (!parsed.access.token || !parsed.refresh.token) {
+      throw iscpError(IscpErrorCodes.AccessInvalid, 'relay did not return credential tokens');
+    }
+    return parsed;
   }
 
   /** POST /v2/relay/devices/refresh-access — rotates both credentials; the old refresh credential is revoked. */

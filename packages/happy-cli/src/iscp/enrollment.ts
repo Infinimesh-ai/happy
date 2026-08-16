@@ -23,26 +23,30 @@ import { join } from 'node:path'
 import {
   createDevice,
   createNobleProvider,
-  decodeTicketFromTransport,
+  decodeEnrollmentFromTransport,
   descriptorPin,
   deviceFromStored,
   Ed25519PrivateKey,
+  enrollmentPayloadFromObject,
   fromBase64Url,
+  grantSigningKey,
   identityThumbprint,
   IscpError,
   RelayHttpClient,
   toBase64Url,
   TrustRootClient,
   utf8Encode,
+  verifyGrant,
+  verifyPairingTicket,
   verifyRelayDescriptor,
   verifyTrustRootDescriptor,
   type CryptoProvider,
   type Device,
   type DeviceIdentity,
-  type PairingTicket,
-  type RelayCredentialPair,
+  type EnrollmentTransportPayload,
   type SignedDescriptor,
   type TrustGrant,
+  type TrustRootDescriptor,
 } from '@slopus/iscp'
 
 import { configuration } from '@/configuration'
@@ -70,11 +74,20 @@ export interface EnrollOptions {
   trustUrl: string
   relayId: string
   trustRootId: string
-  domainId: string
-  /** base64url ticket payload (QR/deep-link), raw ticket JSON, or a file path. */
+  /**
+   * ISCP domain id. Optional in ticket mode (the signed ticket carries the
+   * authoritative domain_id); required for the local-lab bind-self flow.
+   */
+  domainId?: string
+  /**
+   * Enrollment payload: base64url wrapper or bare ticket (QR/deep-link/copy
+   * string from Console/JingSi), raw JSON, or a path to a JSON file.
+   */
   ticket?: string
   deviceId?: string
   profileId?: string
+  /** Display name registered with the Cloud (ticket mode only). */
+  displayName?: string
   /** Print progress lines (device confirmation code etc.). Never prints secrets. */
   log: (line: string) => void
 }
@@ -109,14 +122,42 @@ export function listProfiles(): string[] {
   })
 }
 
-function parseTicket(input: string): PairingTicket {
+/**
+ * Parse an enrollment input: a path to a JSON file, raw JSON, or the
+ * base64url transport string — each either a bare signed ticket or the
+ * Console/JingSi `iscp_enrollment_wrapper`.
+ */
+export function parseEnrollmentInput(input: string): EnrollmentTransportPayload {
   if (existsSync(input)) {
-    return JSON.parse(readFileSync(input, 'utf8')) as PairingTicket
+    return enrollmentPayloadFromObject(JSON.parse(readFileSync(input, 'utf8')))
   }
   if (input.trimStart().startsWith('{')) {
-    return JSON.parse(input) as PairingTicket
+    return enrollmentPayloadFromObject(JSON.parse(input))
   }
-  return decodeTicketFromTransport(input)
+  return decodeEnrollmentFromTransport(input)
+}
+
+/**
+ * Client-side ticket validation before consumption: bound to the discovered
+ * relay/trust root, signed by an active trust root key, inside its window.
+ */
+function verifyTicketAgainstDescriptors(
+  provider: CryptoProvider,
+  payload: EnrollmentTransportPayload,
+  opts: { relayId: string; trustRootId: string; relayDescriptorRelayId: string; trustDescriptor: TrustRootDescriptor },
+): void {
+  const ticket = payload.ticket
+  if (ticket.relay_id !== opts.relayId || ticket.relay_id !== opts.relayDescriptorRelayId) {
+    throw new Error(`pairing ticket is bound to relay ${ticket.relay_id}, but this enrollment targets ${opts.relayId} (descriptor: ${opts.relayDescriptorRelayId})`)
+  }
+  if (ticket.trust_root_id !== opts.trustRootId || ticket.trust_root_id !== opts.trustDescriptor.trust_root_id) {
+    throw new Error(`pairing ticket is bound to trust root ${ticket.trust_root_id}, but this enrollment targets ${opts.trustRootId} (descriptor: ${opts.trustDescriptor.trust_root_id})`)
+  }
+  const signingKey = opts.trustDescriptor.keys.find((k) => k.kid === ticket.signature.kid && k.state !== 'revoked' && k.state !== 'next')
+  if (!signingKey) {
+    throw new Error('pairing ticket is not signed by an active trust root key')
+  }
+  verifyPairingTicket(provider, ticket, signingKey.public)
 }
 
 /**
@@ -159,6 +200,17 @@ export async function enroll(opts: EnrollOptions): Promise<{ profileId: string; 
   const provider = createNobleProvider()
   const { log } = opts
 
+  // 0. Resolve the enrollment payload; the signed ticket carries the
+  //    authoritative domain_id (--domain stays optional in ticket mode).
+  const payload = opts.ticket !== undefined ? parseEnrollmentInput(opts.ticket) : undefined
+  if (payload !== undefined && opts.domainId !== undefined && payload.ticket.domain_id !== opts.domainId) {
+    throw new Error(`pairing ticket is for domain ${payload.ticket.domain_id}, not ${opts.domainId}`)
+  }
+  const domainId = payload?.ticket.domain_id ?? opts.domainId
+  if (domainId === undefined) {
+    throw new Error('a domain id is required when enrolling without a pairing ticket (--domain)')
+  }
+
   // 1. Discover and verify both services; record pins.
   const relayHttp = new RelayHttpClient({ baseUrl: opts.relayUrl, relayId: opts.relayId, provider })
   const trustRoot = new TrustRootClient({ baseUrl: opts.trustUrl, trustRootId: opts.trustRootId, provider })
@@ -169,63 +221,111 @@ export async function enroll(opts: EnrollOptions): Promise<{ profileId: string; 
   log(`Relay:      ${relayDescriptor.relay_id} (${relayDescriptor.base_url})`)
   log(`Trust root: ${trustDescriptor.trust_root_id} (${trustDescriptor.base_url})`)
 
+  // 1b. Ticket mode: verify the ticket client-side BEFORE consuming it —
+  //     signature against an active trust root key, validity window, and
+  //     binding to exactly this relay/trust root pair.
+  if (payload !== undefined) {
+    verifyTicketAgainstDescriptors(provider, payload, {
+      relayId: opts.relayId,
+      trustRootId: opts.trustRootId,
+      relayDescriptorRelayId: relayDescriptor.relay_id,
+      trustDescriptor,
+    })
+    log(`Ticket:     ${payload.ticket.ticket_id} verified (domain ${payload.ticket.domain_id}, expires ${payload.ticket.expires_at})`)
+  }
+
   // 2. Generate the device identity locally. The seed is written only to
-  //    device.key (0600) at the end; it never travels.
+  //    device.key (0600) at the end; it never travels. In ticket mode the
+  //    device id is provisional — the Cloud assigns the official dev_ id.
   const deviceId = opts.deviceId ?? `happy-cli-${toBase64Url(provider.randomBytes(9))}`
-  const device = createDevice(provider, { domainId: opts.domainId, deviceId })
+  let device = createDevice(provider, { domainId, deviceId })
   const thumbprint = identityThumbprint(provider, device.identity)
-  log(`Device id:  ${deviceId}`)
+  log(`Device id:  ${deviceId}${payload !== undefined ? ' (provisional; the Cloud assigns the official id)' : ''}`)
   log(`Thumbprint: ${thumbprint}`)
   log('')
   log(`  Device confirmation code: ${deviceConfirmationCode(provider, device.identity)}`)
   log('  Compare this code out of band before the operator authorizes the device.')
   log('')
 
-  // 3. Relay access: pairing ticket when provided, bind-self otherwise (local-lab dev flow).
-  let credentials: RelayCredentialPair
-  if (opts.ticket !== undefined) {
-    const ticket = parseTicket(opts.ticket)
-    if (ticket.domain_id !== opts.domainId || ticket.relay_id !== opts.relayId) {
-      throw new Error(`pairing ticket is for domain ${ticket.domain_id} / relay ${ticket.relay_id}, not ${opts.domainId} / ${opts.relayId}`)
+  let credentials: { access: { token?: string; expires_at: string }; refresh: { token?: string; expires_at: string } }
+  let grant: TrustGrant
+
+  if (payload !== undefined) {
+    // 3. Managed provisioning (Infinimesh Cloud v2 signed-ticket contract):
+    //    one call registers the device, issues relay credentials, and returns
+    //    the pre-authorized Trust Grant. No trust self-authorization here.
+    const registration = await relayHttp.registerWithSignedTicket(device, payload.ticket, {
+      displayName: payload.displayName ?? opts.displayName,
+      metadata: { product_kind: 'happy', runtime_kind: 'happy-cli' },
+    })
+    log(`Relay access granted via pairing ticket ${payload.ticket.ticket_id}`)
+    log(`Official device id: ${registration.data.device_id} (domain ${registration.data.domain_id})`)
+
+    // Rebuild the identity around the official ids before anything persists;
+    // deviceFromStored re-validates that the key pair matches.
+    const officialIdentity: DeviceIdentity = {
+      ...device.identity,
+      domain_id: registration.data.domain_id,
+      device_id: registration.data.device_id,
     }
-    credentials = await relayHttp.registerWithTicket(device, { ticketId: ticket.ticket_id, maxUses: ticket.max_uses })
-    log(`Relay access granted via pairing ticket ${ticket.ticket_id}`)
+    device = deviceFromStored(provider, officialIdentity, device.privateKey)
+
+    // 4. Verify the returned grant before it ever touches disk: signed by an
+    //    active trust root key, subject = our official id, confirmation = our
+    //    key thumbprint, constrained to this relay, inside its window.
+    grant = registration.grant
+    verifyGrant(provider, grant, grantSigningKey(trustDescriptor, grant.signature.kid), {
+      audience: payload.expectedAudiencePhoneId ?? grant.audience,
+      subjectDeviceId: device.identity.device_id,
+      confirmationThumbprint: device.identity.public_key.kid,
+      permission: grant.permissions[0] ?? 'text',
+      relayId: opts.relayId,
+    })
+    if (payload.expectedAudiencePhoneId !== undefined) {
+      log(`Trust grant verified; audience matches expected phone ${payload.expectedAudiencePhoneId}`)
+    } else {
+      log('Trust grant verified.')
+      log('')
+      log(`  >>> Grant audience (the phone allowed to control this machine): ${grant.audience}`)
+      log('  >>> Confirm this device id on the phone before using the profile.')
+      log('')
+    }
+    credentials = { access: registration.access, refresh: registration.refresh }
   } else {
+    // 3. Local-lab dev flow: bind-self, then trust self-authorization (the
+    //    reference services leave the operator endpoint open).
     credentials = await relayHttp.bindSelf(device)
     log('Relay access granted via bind-self (no ticket; local-lab dev flow)')
+
+    await trustRoot.submitDevice(device)
+    log('Device submitted to trust root')
+    try {
+      const authorized = await trustRoot.authorizeDevice({
+        deviceId,
+        audience: domainId,
+        permissions: ['text'],
+        relayId: opts.relayId,
+        ttlSeconds: 3600,
+      })
+      grant = authorized.grant
+      log('Device authorized (local-lab self-authorization)')
+    } catch (error) {
+      if (!(error instanceof IscpError && error.code === 'ISCPACCESS001')) throw error
+      log('Trust root requires an operator. Waiting for authorization...')
+      await trustRoot.waitForAuthorization(deviceId, { intervalMs: 2000, timeoutMs: 10 * 60 * 1000 })
+      // Reference trust roots expose no device-facing grant fetch; the
+      // operator must deliver the grant (Provisioning Bundle path, Phase 3+).
+      throw new Error('device authorized, but this trust root delivers grants only via a provisioning bundle; re-run with a bundle once issued')
+    }
   }
 
-  // 4. Trust: submit identity, then obtain a grant. Local-lab trust roots
-  //    leave the operator endpoint open, so try self-authorization first and
-  //    fall back to polling for an out-of-band operator approval.
-  await trustRoot.submitDevice(device)
-  log('Device submitted to trust root')
-  let grant: TrustGrant
-  try {
-    const authorized = await trustRoot.authorizeDevice({
-      deviceId,
-      audience: opts.domainId,
-      permissions: ['text'],
-      relayId: opts.relayId,
-      ttlSeconds: 3600,
-    })
-    grant = authorized.grant
-    log('Device authorized (local-lab self-authorization)')
-  } catch (error) {
-    if (!(error instanceof IscpError && error.code === 'ISCPACCESS001')) throw error
-    log('Trust root requires an operator. Waiting for authorization...')
-    await trustRoot.waitForAuthorization(deviceId, { intervalMs: 2000, timeoutMs: 10 * 60 * 1000 })
-    // Reference trust roots expose no device-facing grant fetch; the
-    // operator must deliver the grant (Provisioning Bundle path, Phase 3+).
-    throw new Error('device authorized, but this trust root delivers grants only via a provisioning bundle; re-run with a bundle once issued')
-  }
-
-  // 5. Persist the profile bundle.
-  const profileId = opts.profileId ?? `${opts.domainId}-${opts.relayId}`
+  // 5. Persist the profile bundle (only after every verification passed —
+  //    a failed enrollment leaves no partial files behind).
+  const profileId = opts.profileId ?? `${device.identity.domain_id}-${opts.relayId}`
   const bundle: IscpProfileBundle = {
     version: 1,
     profile_id: profileId,
-    domain_id: opts.domainId,
+    domain_id: device.identity.domain_id,
     relay_id: opts.relayId,
     trust_root_id: opts.trustRootId,
     relay_descriptor: signedRelay,

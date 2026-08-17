@@ -65,6 +65,17 @@ export const SignedTicketRegistrationSchema = z.object({
 });
 export type SignedTicketRegistration = z.infer<typeof SignedTicketRegistrationSchema>;
 
+/**
+ * 201 response of the v2 grant renewal
+ * (`POST /v2/relay/devices/renew-grant`): the device record and the freshly
+ * signed Trust Grant. No credentials rotate on renewal.
+ */
+export const GrantRenewalSchema = z.object({
+  data: RegisteredDeviceSchema,
+  grant: TrustGrantSchema,
+});
+export type GrantRenewal = z.infer<typeof GrantRenewalSchema>;
+
 export type FetchLike = (url: string, init?: {
   method?: string;
   headers?: Record<string, string>;
@@ -201,6 +212,54 @@ export class RelayHttpClient {
       throw iscpError(IscpErrorCodes.AccessInvalid, 'relay did not return credential tokens');
     }
     return parsed;
+  }
+
+  /**
+   * POST /v2/relay/devices/renew-grant — Infinimesh Cloud grant renewal
+   * (frozen contract, OPS 2026-08-17 §4.3).
+   *
+   * Sends the renewal id, the enrolled identity, and a possession proof bound
+   * to this relay with `challenge = renewal_id`. The device key never changes:
+   * renewal only re-issues the Trust Grant for the already-registered device.
+   * An `Idempotency-Key` header is generated once and reused on the automatic
+   * network-failure retry so an interrupted first attempt is replayed, not
+   * double-consumed.
+   */
+  async renewGrant(
+    device: Device,
+    renewalId: string,
+    opts?: { idempotencyKey?: string },
+  ): Promise<GrantRenewal> {
+    const proof = createDeviceProof(this.provider, device, {
+      audience: this.relayId,
+      challenge: renewalId,
+      now: this.now(),
+    });
+    const path = '/v2/relay/devices/renew-grant';
+    const body = JSON.stringify({
+      renewal_id: renewalId,
+      identity: device.identity,
+      identity_proof: proof,
+    });
+    const headers = {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': opts?.idempotencyKey ?? toBase64Url(this.provider.randomBytes(18)),
+    };
+    let response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${path}`, { method: 'POST', headers, body });
+    } catch {
+      // Network interruption: retry once with the identical body and
+      // Idempotency-Key — if the first request landed, the Cloud replays the
+      // stored response instead of consuming the renewal again.
+      response = await this.fetchImpl(`${this.baseUrl}${path}`, { method: 'POST', headers, body });
+    }
+    if (!response.ok) await parseError(response, 'grant renewal');
+    const raw = (await response.json()) as { grant?: unknown };
+    if (raw === null || typeof raw !== 'object' || raw.grant === undefined) {
+      throw iscpError(IscpErrorCodes.TrustInvalid, 'grant renewal did not return a trust grant');
+    }
+    return GrantRenewalSchema.parse(raw);
   }
 
   /** POST /v2/relay/devices/refresh-access — rotates both credentials; the old refresh credential is revoked. */

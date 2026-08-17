@@ -56,6 +56,43 @@ export async function daemonPost(path: string, body?: any): Promise<{ error?: st
   }
 }
 
+export async function daemonGet(path: string): Promise<{ error?: string } | any> {
+  const state = await readDaemonState();
+  if (!state?.httpPort) {
+    const errorMessage = 'No daemon running, no state file found';
+    logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+    return { error: errorMessage };
+  }
+
+  try {
+    process.kill(state.pid, 0);
+  } catch (error) {
+    const errorMessage = 'Daemon is not running, file is stale';
+    logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+    return { error: errorMessage };
+  }
+
+  try {
+    const timeout = process.env.HAPPY_DAEMON_HTTP_TIMEOUT ? parseInt(process.env.HAPPY_DAEMON_HTTP_TIMEOUT) : 10_000;
+    const response = await fetch(`http://127.0.0.1:${state.httpPort}${path}`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(timeout)
+    });
+
+    if (!response.ok) {
+      const errorMessage = `Request failed: ${path}, HTTP ${response.status}`;
+      logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+      return { error: errorMessage };
+    }
+
+    return await response.json();
+  } catch (error) {
+    const errorMessage = `Request failed: ${path}, ${error instanceof Error ? error.message : 'Unknown error'}`;
+    logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+    return { error: errorMessage };
+  }
+}
+
 const SESSION_STARTED_RETRY_TIMEOUT_MS = 3000;
 const SESSION_STARTED_RETRY_INTERVAL_MS = 100;
 

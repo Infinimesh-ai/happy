@@ -12,6 +12,17 @@ import { decodeBase64 } from '@/api/encryption';
 import { TrackedSession, SessionEncryptionData } from './types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 import type { DaemonIscpService } from '@/iscp/daemonIscp';
+import type { ProfilePeerStatus } from '@/iscp/sessionInitiator';
+
+const ProfilePeerStatusSchema = z.object({
+  profileId: z.string(),
+  deviceId: z.string(),
+  generation: z.number(),
+  connectionState: z.string(),
+  session: z.enum(['connecting', 'ready', 'authorization_expired', 'failed']),
+  sessionDetail: z.string().optional(),
+  peerDeviceId: z.string(),
+});
 
 export function startDaemonControlServer({
   getChildren,
@@ -19,7 +30,9 @@ export function startDaemonControlServer({
   spawnSession,
   requestShutdown,
   onHappySessionWebhook,
-  iscp
+  iscp,
+  reloadIscpPeers,
+  getIscpPeerStatuses
 }: {
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string) => boolean;
@@ -28,6 +41,10 @@ export function startDaemonControlServer({
   onHappySessionWebhook: (sessionId: string, metadata: Metadata, encryption?: SessionEncryptionData) => void;
   /** ISCP-mode ingestion (dual-stack). Absent when no ISCP profile is enrolled. */
   iscp?: DaemonIscpService;
+  /** Hot-reload of ISCP peers (single-flight; wired to POST /iscp/reload). */
+  reloadIscpPeers?: () => Promise<{ profiles: string[] }>;
+  /** Per-profile transport + session diagnostics (GET /iscp/peer-status). */
+  getIscpPeerStatuses?: () => ProfilePeerStatus[];
 }): Promise<{ port: number; stop: () => Promise<void> }> {
   return new Promise((resolve) => {
     const app = fastify({
@@ -257,6 +274,43 @@ export function startDaemonControlServer({
       iscp.registerSessionRpcPort(profileId, sessionId, port);
       logger.debug(`[CONTROL SERVER] ISCP session RPC registered: ${sessionId} → 127.0.0.1:${port}`);
       return { status: 'ok' as const };
+    });
+
+    // ISCP hot reload: rescan enrolled profiles and restart the peers.
+    // Called by `happy iscp enroll` / `happy iscp renew` after a profile
+    // change; single-flight semantics live in createIscpPeersController.
+    typed.post('/iscp/reload', {
+      schema: {
+        response: {
+          200: z.object({ profiles: z.array(z.string()) }),
+          503: z.object({ error: z.string() })
+        }
+      }
+    }, async (request, reply) => {
+      if (!reloadIscpPeers) {
+        reply.code(503);
+        return { error: 'ISCP is not enabled on this daemon' };
+      }
+      const result = await reloadIscpPeers();
+      logger.debug(`[CONTROL SERVER] ISCP peers reloaded (profiles: ${result.profiles.join(', ') || 'none'})`);
+      return result;
+    });
+
+    // ISCP per-profile diagnostics: relay transport + E2E session state,
+    // consumed by `happy iscp status --check` layers 5 and 6.
+    typed.get('/iscp/peer-status', {
+      schema: {
+        response: {
+          200: z.object({ profiles: z.array(ProfilePeerStatusSchema) }),
+          503: z.object({ error: z.string() })
+        }
+      }
+    }, async (request, reply) => {
+      if (!getIscpPeerStatuses) {
+        reply.code(503);
+        return { error: 'ISCP is not enabled on this daemon' };
+      }
+      return { profiles: getIscpPeerStatuses() };
     });
 
     // Stop daemon

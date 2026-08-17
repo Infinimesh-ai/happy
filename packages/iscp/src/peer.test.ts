@@ -6,7 +6,7 @@ import { IscpError } from './errors';
 import { createDevice, identityThumbprint, type Device } from './identity';
 import { IscpPeer } from './peer';
 import { signObject } from './signing';
-import { TRUST_GRANT_TYPE, type DeviceIdentity, type RelayDescriptor, type TrustGrant } from './schemas';
+import { SESSION_HELLO_TYPE, TRUST_GRANT_TYPE, type DeviceIdentity, type RelayDescriptor, type TrustGrant } from './schemas';
 import { FakeRelay } from './testing/fakeRelay';
 
 const provider = createNobleProvider();
@@ -199,6 +199,66 @@ describe('IscpPeer over an in-memory relay', () => {
       alpha.peer.stop();
       beta.peer.stop();
     }
+  });
+
+  it('closeSession rejects pending openSession waiters (retryable) and drops the session entry', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    let identityResolutions = 0;
+    const alpha = createTestPeer(relay, 'device-alpha', identities, issuer);
+    const beta = createTestPeer(relay, 'device-beta', identities, issuer);
+    void beta; // identity registered; the peer never comes online
+    const countingPeer = new IscpPeer({
+      device: alpha.device,
+      grant: makeGrant(issuer, alpha.device, relay.relayId),
+      relayDescriptor: relayDescriptor(relay),
+      credentials: relay.issueCredentials('device-alpha'),
+      resolvePeerIdentity: async (id) => {
+        identityResolutions += 1;
+        return identities.get(id)!;
+      },
+      manifest: { device: 'device-alpha' },
+      provider,
+      wsFactory: relay.wsFactory,
+      fetchImpl: relay.fetchImpl,
+    });
+    countingPeer.start();
+    try {
+      await waitFor(() => countingPeer.connectionState === 'READY', 5000, 'alpha READY');
+      const pending = countingPeer.openSession('device-beta', { timeoutMs: 60_000 });
+      pending.catch(() => { }); // observed below
+      // Wait until the hello envelope actually reached the relay (the session
+      // entry and its ready-waiter are registered right after submission).
+      await waitFor(() => relay.submitted.some((e) => e.payload_type === SESSION_HELLO_TYPE), 5000, 'first hello sent');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(identityResolutions).toBe(1);
+
+      countingPeer.closeSession('device-beta');
+      const error = await pending.catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(IscpError);
+      expect((error as IscpError).code).toBe('ISCPSESSION001');
+      expect((error as IscpError).retryable).toBe(true);
+
+      // The session entry is gone: a fresh openSession re-resolves the peer
+      // identity and sends a NEW hello. Without closeSession it would keep
+      // waiting on the stale session (the SDK never re-sends Hello).
+      const second = countingPeer.openSession('device-beta', { timeoutMs: 250 });
+      const secondError = await second.catch((e: unknown) => e);
+      expect(identityResolutions).toBe(2);
+      expect(secondError).toBeInstanceOf(IscpError);
+      expect((secondError as IscpError).retryable).toBe(true); // timed out again — peer still offline
+    } finally {
+      countingPeer.stop();
+    }
+  });
+
+  it('closeSession on an unknown peer is a no-op', () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const alpha = createTestPeer(relay, 'device-alpha', identities, issuer);
+    expect(() => alpha.peer.closeSession('device-never-seen')).not.toThrow();
   });
 
   it('rotates credentials when the relay rejects the access token', async () => {

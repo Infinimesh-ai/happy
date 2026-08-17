@@ -20,7 +20,7 @@ import type { PersistedSession } from '@/persistence';
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
 import { DaemonIscpService } from '@/iscp/daemonIscp';
-import { startDaemonIscpPeers } from '@/iscp/daemonPeer';
+import { createIscpPeersController, startDaemonIscpPeers } from '@/iscp/daemonPeer';
 import { statSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
@@ -819,6 +819,16 @@ export async function startDaemon(): Promise<void> {
     // peer itself (workstream 2) only comes online for enrolled profiles.
     const iscp = new DaemonIscpService();
 
+    // Reload-able ISCP peers: enrolled profiles are (re)scanned on startup
+    // and whenever POST /iscp/reload fires (single-flight — concurrent
+    // triggers coalesce, and the previous peers are always stopped first).
+    const iscpPeers = createIscpPeersController(() => startDaemonIscpPeers({
+      iscp,
+      getChildren: getCurrentChildren,
+      stopSession,
+      spawnSession
+    }));
+
     // Start control server
     const { port: controlPort, stop: stopControlServer } = await startDaemonControlServer({
       getChildren: getCurrentChildren,
@@ -826,7 +836,9 @@ export async function startDaemon(): Promise<void> {
       spawnSession,
       requestShutdown: () => requestShutdown('happy-cli'),
       onHappySessionWebhook,
-      iscp
+      iscp,
+      reloadIscpPeers: () => iscpPeers.reload(),
+      getIscpPeerStatuses: () => iscpPeers.statuses()
     });
 
     // Write initial daemon state (no lock needed for state file)
@@ -842,16 +854,10 @@ export async function startDaemon(): Promise<void> {
 
     // ISCP dual-stack: bring enrolled profiles online as ISCP peers. Failures
     // are logged and never block legacy operation.
-    let iscpPeers: { profiles: string[]; stop: () => void } = { profiles: [], stop: () => { } };
     try {
-      iscpPeers = await startDaemonIscpPeers({
-        iscp,
-        getChildren: getCurrentChildren,
-        stopSession,
-        spawnSession
-      });
-      if (iscpPeers.profiles.length > 0) {
-        logger.debug(`[DAEMON RUN] ISCP peers online for profiles: ${iscpPeers.profiles.join(', ')}`);
+      const { profiles } = await iscpPeers.reload();
+      if (profiles.length > 0) {
+        logger.debug(`[DAEMON RUN] ISCP peers online for profiles: ${profiles.join(', ')}`);
       }
     } catch (error) {
       logger.debug('[DAEMON RUN] ISCP peer startup failed', { error });

@@ -156,6 +156,20 @@ export class IscpPeer {
     this.ws.stop();
   }
 
+  /**
+   * Forget the session with a peer: drops the sessions entry and rejects any
+   * pending openSession waiters with a retryable session error. The relay WS
+   * is untouched. Callers use this after an openSession timeout so the next
+   * openSession sends a fresh hello instead of waiting on the stale session.
+   */
+  closeSession(peerDeviceId: string): void {
+    const session = this.sessions.get(peerDeviceId);
+    if (!session) return;
+    this.sessions.delete(peerDeviceId);
+    const error = iscpError(IscpErrorCodes.SessionInvalid, 'session closed locally before peer became ready', { retryable: true });
+    for (const waiter of session.readyWaiters.splice(0)) waiter.reject(error);
+  }
+
   /** Initiate a session with a peer. Resolves once capability manifests are exchanged. */
   async openSession(peerDeviceId: string, opts?: { timeoutMs?: number }): Promise<unknown> {
     const existing = this.sessions.get(peerDeviceId);
@@ -331,7 +345,11 @@ export class IscpPeer {
         clearTimeout(timer);
         resolve(manifest);
       };
-      session.readyWaiters.push({ resolve: wrappedResolve, reject });
+      const wrappedReject = (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      };
+      session.readyWaiters.push({ resolve: wrappedResolve, reject: wrappedReject });
     });
   }
 

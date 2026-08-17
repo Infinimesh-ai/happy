@@ -27,6 +27,7 @@
 import { fromBase64Url, toBase64Url, utf8Decode, utf8Encode } from './encoding';
 import { IscpError, IscpErrorCodes, iscpError } from './errors';
 import type { Device } from './identity';
+import { compareCodePoints } from './jcs';
 import { createNobleProvider } from './crypto/noble';
 import type { CryptoProvider } from './crypto/provider';
 import { RelayHttpClient, type FetchLike } from './relay/http';
@@ -95,6 +96,13 @@ export class IscpPeer {
   private readonly ws: RelayWsClient;
   private readonly manifestPayloadType: string;
   private readonly sessions = new Map<string, PeerSession>();
+  /**
+   * Session ids we have abandoned, per peer (closed locally or lost a
+   * competing-session tie-break). Late hello/ready envelopes for these ids
+   * are dropped instead of re-adopted — without this, two queued hellos from
+   * the same initiator make both sides flip between the session ids forever.
+   */
+  private readonly staleSessionIds = new Map<string, Set<string>>();
   private readonly outboundQueue: SecureEnvelope[] = [];
   private accessToken: string;
   private refreshToken: string;
@@ -166,6 +174,7 @@ export class IscpPeer {
     const session = this.sessions.get(peerDeviceId);
     if (!session) return;
     this.sessions.delete(peerDeviceId);
+    this.markSessionStale(peerDeviceId, session.sessionId);
     const error = iscpError(IscpErrorCodes.SessionInvalid, 'session closed locally before peer became ready', { retryable: true });
     for (const waiter of session.readyWaiters.splice(0)) waiter.reject(error);
   }
@@ -196,7 +205,16 @@ export class IscpPeer {
       this.sessions.set(peerDeviceId, session);
       await this.submitHandshake(peerDeviceId, sessionId, SESSION_HELLO_TYPE, local.hello);
     }
-    return this.waitForPeerReady(session, opts?.timeoutMs ?? 60_000);
+    // The awaits above suspend: our just-created session can lose a
+    // competing-session tie-break (dual initiator) and be replaced by an
+    // adopted responder session in the meantime. Always wait on the CURRENT
+    // session for this peer — a waiter attached to the superseded object
+    // would never resolve.
+    const current = this.sessions.get(peerDeviceId);
+    if (!current) {
+      throw iscpError(IscpErrorCodes.SessionInvalid, 'session was closed while opening', { retryable: true });
+    }
+    return this.waitForPeerReady(current, opts?.timeoutMs ?? 60_000);
   }
 
   /** Send a business payload. Forbidden before session.ready + manifest exchange. */
@@ -271,12 +289,26 @@ export class IscpPeer {
   private async handleHello(envelope: SecureEnvelope): Promise<void> {
     const hello = SessionHelloSchema.parse(JSON.parse(utf8Decode(fromBase64Url(envelope.ciphertext))));
     const peerDeviceId = hello.device_id;
+    if (this.isSessionStale(peerDeviceId, hello.session_id)) return; // late reply to a session we abandoned
     let session = this.sessions.get(peerDeviceId);
+    let carriedWaiters: PeerSession['readyWaiters'] = [];
     if (session && session.sessionId !== hello.session_id) {
-      // A stale or competing session: latest initiator wins only if we have
-      // no established state yet.
+      // Competing session. The tie-break must pick the same winner on both
+      // sides or the peers flip between session ids forever:
+      // - an established session always wins;
+      // - if the peer re-initiated (our session is theirs too, role
+      //   'responder'), the newest hello wins — relay delivery is FIFO, so
+      //   both sides see the same "newest";
+      // - if both sides initiated, the session of the device with the lower
+      //   device id wins.
+      // The losing session id is tombstoned so its late replies are dropped.
       if (session.state?.ready) return;
+      if (session.role === 'initiator' && compareCodePoints(this.opts.device.identity.device_id, peerDeviceId) < 0) {
+        return;
+      }
       this.sessions.delete(peerDeviceId);
+      this.markSessionStale(peerDeviceId, session.sessionId);
+      carriedWaiters = session.readyWaiters.splice(0);
       session = undefined;
     }
     if (!session) {
@@ -299,7 +331,7 @@ export class IscpPeer {
         local,
         state,
         manifestSent: false,
-        readyWaiters: [],
+        readyWaiters: carriedWaiters,
       };
       this.sessions.set(peerDeviceId, session);
       await this.submitHandshake(peerDeviceId, hello.session_id, SESSION_HELLO_TYPE, local.hello);
@@ -316,7 +348,9 @@ export class IscpPeer {
 
   private async handleReady(envelope: SecureEnvelope): Promise<void> {
     const ready = SessionReadySchema.parse(JSON.parse(utf8Decode(fromBase64Url(envelope.ciphertext))));
+    if (this.isSessionStale(envelope.sender_device_id, ready.session_id)) return; // late reply to a session we abandoned
     const session = this.sessions.get(envelope.sender_device_id);
+    if (session && ready.session_id !== session.sessionId) return; // ready for a session that lost the tie-break
     if (!session?.state) {
       throw iscpError(IscpErrorCodes.SessionInvalid, 'session ready received before hello exchange');
     }
@@ -327,6 +361,23 @@ export class IscpPeer {
       session.manifestSent = true;
       await this.sendPayload(session.peerDeviceId, this.manifestPayloadType, utf8Encode(JSON.stringify(this.opts.manifest)));
     }
+  }
+
+  private markSessionStale(peerDeviceId: string, sessionId: string): void {
+    let stale = this.staleSessionIds.get(peerDeviceId);
+    if (!stale) {
+      stale = new Set();
+      this.staleSessionIds.set(peerDeviceId, stale);
+    }
+    stale.add(sessionId);
+    // Bounded: only recently-abandoned ids matter (in-flight relay replies).
+    while (stale.size > 32) {
+      stale.delete(stale.values().next().value as string);
+    }
+  }
+
+  private isSessionStale(peerDeviceId: string, sessionId: string): boolean {
+    return this.staleSessionIds.get(peerDeviceId)?.has(sessionId) ?? false;
   }
 
   // -------------------------------------------------------------------------

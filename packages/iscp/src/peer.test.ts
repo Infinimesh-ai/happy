@@ -6,7 +6,7 @@ import { IscpError } from './errors';
 import { createDevice, identityThumbprint, type Device } from './identity';
 import { IscpPeer } from './peer';
 import { signObject } from './signing';
-import { SESSION_HELLO_TYPE, TRUST_GRANT_TYPE, type DeviceIdentity, type RelayDescriptor, type TrustGrant } from './schemas';
+import { SESSION_HELLO_TYPE, SESSION_READY_TYPE, TRUST_GRANT_TYPE, type DeviceIdentity, type RelayDescriptor, type TrustGrant } from './schemas';
 import { FakeRelay } from './testing/fakeRelay';
 
 const provider = createNobleProvider();
@@ -259,6 +259,87 @@ describe('IscpPeer over an in-memory relay', () => {
     const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
     const alpha = createTestPeer(relay, 'device-alpha', identities, issuer);
     expect(() => alpha.peer.closeSession('device-never-seen')).not.toThrow();
+  });
+
+  it('converges on one session when a peer drains competing hellos from before and after closeSession', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const alpha = createTestPeer(relay, 'device-alpha', identities, issuer);
+    const beta = createTestPeer(relay, 'device-beta', identities, issuer);
+    alpha.peer.start();
+    try {
+      await waitFor(() => alpha.peer.connectionState === 'READY', 5000, 'alpha READY');
+
+      // Hello #1 queues at the relay while beta is offline; alpha gives up on it.
+      const first = alpha.peer.openSession('device-beta', { timeoutMs: 60_000 });
+      first.catch(() => { });
+      await waitFor(() => relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE).length === 1, 5000, 'first hello queued');
+      alpha.peer.closeSession('device-beta');
+      await expect(first).rejects.toMatchObject({ retryable: true });
+
+      // Hello #2 (fresh session id) queues behind the abandoned hello #1.
+      const second = alpha.peer.openSession('device-beta', { timeoutMs: 5000 });
+      await waitFor(() => relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE).length === 2, 5000, 'second hello queued');
+
+      // Beta comes online and drains BOTH hellos. Without a deterministic
+      // tie-break both peers keep deleting and re-adopting the two session
+      // ids at microtask speed — an unbounded hello/ready storm.
+      beta.peer.start();
+      expect(await second).toMatchObject({ device: 'device-beta' });
+      await waitFor(() => beta.manifests.length > 0, 5000, 'beta receives alpha manifest');
+
+      // The surviving session carries payloads.
+      await alpha.peer.sendPayload('device-beta', 'text', utf8Encode('{"text":"after competing hellos"}'));
+      await waitFor(() => beta.received.length > 0, 5000, 'payload after convergence');
+
+      // Bounded handshake traffic: alpha sends hello S1, hello S2, ready S2;
+      // beta answers each drained hello with at most hello+ready. Anything
+      // beyond that means the competing-session livelock is back.
+      expect(relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE).length).toBeLessThanOrEqual(4);
+      expect(relay.submitted.filter((e) => e.payload_type === SESSION_READY_TYPE).length).toBeLessThanOrEqual(3);
+      expect(alpha.errors).toEqual([]);
+      expect(beta.errors).toEqual([]);
+    } finally {
+      alpha.peer.stop();
+      beta.peer.stop();
+    }
+  });
+
+  it('resolves a dual-initiator race deterministically (lower device id wins)', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const alpha = createTestPeer(relay, 'device-alpha', identities, issuer);
+    const beta = createTestPeer(relay, 'device-beta', identities, issuer);
+    alpha.peer.start();
+    beta.peer.start();
+    try {
+      await waitFor(() => alpha.peer.connectionState === 'READY' && beta.peer.connectionState === 'READY', 5000, 'both READY');
+
+      // Both sides dial each other before either hello lands: two initiator
+      // sessions with different ids for the same pair. The tie-break must
+      // keep exactly one (the lower device id's session) on BOTH sides.
+      const fromAlpha = alpha.peer.openSession('device-beta', { timeoutMs: 5000 });
+      const fromBeta = beta.peer.openSession('device-alpha', { timeoutMs: 5000 });
+      expect(await fromAlpha).toMatchObject({ device: 'device-beta' });
+      expect(await fromBeta).toMatchObject({ device: 'device-alpha' });
+
+      // Payloads flow both ways over the surviving session.
+      await alpha.peer.sendPayload('device-beta', 'text', utf8Encode('{"text":"alpha->beta"}'));
+      await beta.peer.sendPayload('device-alpha', 'text', utf8Encode('{"text":"beta->alpha"}'));
+      await waitFor(() => beta.received.length > 0 && alpha.received.length > 0, 5000, 'payloads both ways');
+
+      // Two initial hellos + at most one responder hello for the winning
+      // session; more means both sessions stayed alive or the storm is back.
+      expect(relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE).length).toBeLessThanOrEqual(3);
+      expect(relay.submitted.filter((e) => e.payload_type === SESSION_READY_TYPE).length).toBeLessThanOrEqual(2);
+      expect(alpha.errors).toEqual([]);
+      expect(beta.errors).toEqual([]);
+    } finally {
+      alpha.peer.stop();
+      beta.peer.stop();
+    }
   });
 
   it('rotates credentials when the relay rejects the access token', async () => {

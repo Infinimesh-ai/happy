@@ -129,7 +129,17 @@ export async function notifyDaemonSessionStarted(
 
 export async function listDaemonSessions(): Promise<any[]> {
   const result = await daemonPost('/list');
-  return result.children || [];
+  const children: any[] = result.children || [];
+  // Additive: agents the daemon did not spawn (it restarted underneath them)
+  // but whose session-RPC heartbeat re-registered — reachable, hence active.
+  const reattached = ((result.iscpAgents || []) as Array<{ sessionId: string; profileId: string }>)
+    .filter((agent) => !children.some((child) => child.happySessionId === agent.sessionId))
+    .map((agent) => ({
+      startedBy: 'reattached via ISCP session-RPC heartbeat (daemon restarted)',
+      happySessionId: agent.sessionId,
+      profileId: agent.profileId,
+    }));
+  return [...children, ...reattached];
 }
 
 export async function stopDaemonSession(sessionId: string): Promise<boolean> {

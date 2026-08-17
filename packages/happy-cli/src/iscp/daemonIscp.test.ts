@@ -37,6 +37,32 @@ describe('DaemonIscpService', () => {
     ])
   })
 
+  it('enumerates registered rpc sessions per profile and for the daemon list view', () => {
+    iscp.registerSessionRpcPort('p1', 's1', 1000)
+    iscp.registerSessionRpcPort('p1', 's2', 1001)
+    iscp.registerSessionRpcPort('p2', 's3', 1002)
+    expect(iscp.sessionIdsWithRpcPort('p1').sort()).toEqual(['s1', 's2'])
+    expect(iscp.sessionIdsWithRpcPort('p2')).toEqual(['s3'])
+    expect(iscp.sessionIdsWithRpcPort('p3')).toEqual([])
+    expect(iscp.listRegisteredRpcSessions().sort((a, b) => a.sessionId.localeCompare(b.sessionId))).toEqual([
+      { sessionId: 's1', profileId: 'p1', port: 1000 },
+      { sessionId: 's2', profileId: 'p1', port: 1001 },
+      { sessionId: 's3', profileId: 'p2', port: 1002 },
+    ])
+    iscp.unregisterSessionRpcPort('s1')
+    expect(iscp.sessionIdsWithRpcPort('p1')).toEqual(['s2'])
+  })
+
+  it('a fresh service (daemon restart) emits agent_reachable on the first heartbeat re-registration', () => {
+    // The restarted daemon has an empty port table; the surviving agent's
+    // heartbeat re-registration is indistinguishable from a first
+    // registration and must fire the lifecycle machine-event source.
+    expect(iscp.registerSessionRpcPort('p1', 's1', 1000)).toBe(true)
+    expect(lifecycle).toEqual([
+      { profileId: 'p1', sessionId: 's1', change: 'changed', reason: 'agent_reachable' },
+    ])
+  })
+
   it('emits agent_unreachable when a registration is dropped', () => {
     iscp.registerSessionRpcPort('p1', 's1', 1000)
     lifecycle.length = 0

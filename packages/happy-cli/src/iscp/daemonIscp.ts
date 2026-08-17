@@ -82,6 +82,30 @@ export class DaemonIscpService {
     return entry.port
   }
 
+  /**
+   * Sessions whose agent RPC bridge is currently registered for a profile.
+   * After a daemon restart the agent processes are NOT children of the new
+   * daemon, but their lifetime heartbeat re-registers here within one
+   * interval — a live registration is the daemon's proof of a reachable
+   * agent, so liveness views must union this with the child-process table.
+   */
+  sessionIdsWithRpcPort(profileId: string): string[] {
+    const ids: string[] = []
+    for (const [sessionId, entry] of this.sessionRpcPorts) {
+      if (entry.profileId === profileId) ids.push(sessionId)
+    }
+    return ids
+  }
+
+  /** All registered agent RPC bridges (for the daemon control /list view). */
+  listRegisteredRpcSessions(): Array<{ sessionId: string; profileId: string; port: number }> {
+    return [...this.sessionRpcPorts.entries()].map(([sessionId, entry]) => ({
+      sessionId,
+      profileId: entry.profileId,
+      port: entry.port,
+    }))
+  }
+
   log(profileId: string): DaemonEventLog {
     if (profileId === '' || profileId.includes('/') || profileId.includes('\\') || profileId === '.' || profileId === '..') {
       throw new Error(`invalid ISCP profile id: ${JSON.stringify(profileId)}`)

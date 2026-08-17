@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { decodeWireCursor } from '@slopus/happy-wire'
 
-import { DaemonIscpService } from './daemonIscp'
+import { DaemonIscpService, type SessionLifecycleNotification } from './daemonIscp'
 import { WireResponder, type WireResponderDeps } from './wireResponder'
 import type { TrackedSession } from '@/daemon/types'
 
@@ -187,6 +187,80 @@ describe('WireResponder', () => {
   it('rejects unknown methods as unsupported and keeps wakeup.v1 as a hook point', async () => {
     expect(await responder.handle({ id: 'x', method: 'nope', params: {} })).toMatchObject({ ok: false, error: { code: 'unsupported' } })
     expect(await responder.handle({ id: 'w', method: 'wakeup.v1', params: {} })).toMatchObject({ ok: false, error: { code: 'unsupported' } })
+  })
+
+  it('daemon restart: heartbeat re-registration alone marks the session active and fires session.lifecycle', async () => {
+    // Life before the restart: the session ran as a child and left history
+    // (and display attributes) in the on-disk event log.
+    const child: TrackedSession = {
+      startedBy: 'daemon',
+      happySessionId: 'sess-survivor',
+      pid: 4321,
+      happySessionMetadataFromLocalWebhook: {
+        path: '/tmp/proj',
+        host: 'localhost',
+        name: 'Survivor',
+        homeDir: '/home/u',
+        happyHomeDir: '/home/u/.happy',
+        happyLibDir: '/home/u/.happy/lib',
+        happyToolsDir: '/home/u/.happy/tools',
+      },
+    }
+    responder = build({ getChildren: () => [child] })
+    iscp.ingest('p1', 'sess-survivor', [{ body: { t: 'hello' } }])
+    await responder.handle({ id: 'l0', method: 'sessions.list', params: {} })
+
+    // Daemon restart: fresh in-memory state over the same on-disk log — the
+    // agent process survives but is NOT a child of the new daemon.
+    const restarted = new DaemonIscpService((profileId) => join(root, profileId))
+    const lifecycle: SessionLifecycleNotification[] = []
+    restarted.events.on('session-lifecycle', (n: SessionLifecycleNotification) => lifecycle.push(n))
+    const listSessions = async (r: WireResponder) => {
+      const response = await r.handle({ id: 'l', method: 'sessions.list', params: {} })
+      return (response as { ok: true; result: { sessions: Array<Record<string, unknown>> } }).result.sessions
+    }
+    const freshResponder = new WireResponder({
+      iscp: restarted,
+      profileId: 'p1',
+      getChildren: () => [],
+      stopSession,
+      spawnSession,
+    })
+
+    // Before the heartbeat lands, the session reads as idle history.
+    const before = await listSessions(freshResponder)
+    expect(before.find((s) => s.sessionId === 'sess-survivor')).toMatchObject({ active: false, lifecycle: 'idle' })
+
+    // The agent's lifetime heartbeat re-registers its RPC port with the new
+    // daemon → the machine-event source fires (the app converges without
+    // polling) and sessions.list reports active despite no child entry.
+    restarted.registerSessionRpcPort('p1', 'sess-survivor', 4242)
+    expect(lifecycle).toEqual([
+      { profileId: 'p1', sessionId: 'sess-survivor', change: 'changed', reason: 'agent_reachable' },
+    ])
+    const after = await listSessions(freshResponder)
+    const survivor = after.find((s) => s.sessionId === 'sess-survivor')
+    expect(survivor).toMatchObject({ active: true, lifecycle: 'active', displayName: 'Survivor' })
+    // No child-process entry means no pid — the field stays optional/absent.
+    expect(survivor!.pid).toBeUndefined()
+
+    // A reattached agent is running: archiving it must conflict.
+    expect(await freshResponder.handle({ id: 'a', method: 'sessions.archive', params: { sessionId: 'sess-survivor' } }))
+      .toMatchObject({ ok: false, error: { code: 'conflict' } })
+
+    // When the registration drops (agent exit), the session folds back to
+    // idle and the unreachable transition fires.
+    restarted.unregisterSessionRpcPort('sess-survivor')
+    expect(lifecycle[1]).toEqual({ profileId: 'p1', sessionId: 'sess-survivor', change: 'changed', reason: 'agent_unreachable' })
+    const gone = await listSessions(freshResponder)
+    expect(gone.find((s) => s.sessionId === 'sess-survivor')).toMatchObject({ active: false, lifecycle: 'idle' })
+  })
+
+  it('sessions.list ignores rpc registrations owned by another profile', async () => {
+    iscp.registerSessionRpcPort('p2', 'sess-foreign', 4243)
+    const response = await responder.handle({ id: 'l', method: 'sessions.list', params: {} })
+    const { sessions } = (response as { ok: true; result: { sessions: Array<Record<string, unknown>> } }).result
+    expect(sessions.find((s) => s.sessionId === 'sess-foreign')).toBeUndefined()
   })
 
   it('session.rpc separates unknown sessions from unreachable agents', async () => {

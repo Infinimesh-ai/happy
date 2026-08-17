@@ -106,21 +106,30 @@ export function startDaemonControlServer({
               startedBy: z.string(),
               happySessionId: z.string(),
               pid: z.number()
-            }))
+            })),
+            // Additive: agents that are not children of THIS daemon process
+            // (it restarted) but whose lifetime heartbeat re-registered a
+            // live session RPC bridge — they are reachable, not idle.
+            iscpAgents: z.array(z.object({
+              sessionId: z.string(),
+              profileId: z.string(),
+              port: z.number()
+            })).optional()
           })
         }
       }
     }, async () => {
       const children = getChildren();
       logger.debug(`[CONTROL SERVER] Listing ${children.length} sessions`);
-      return { 
+      return {
         children: children
           .filter(child => child.happySessionId !== undefined)
           .map(child => ({
             startedBy: child.startedBy,
             happySessionId: child.happySessionId!,
             pid: child.pid
-          }))
+          })),
+        ...(iscp ? { iscpAgents: iscp.listRegisteredRpcSessions() } : {})
       }
     });
 

@@ -711,12 +711,13 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
       options.claudeArgs = [...(options.claudeArgs || []), ...unknownArgs]
     }
 
-    // Resolve Chrome mode: explicit flag > settings > false
-    const settings = await readSettings()
-    const chromeEnabled = chromeOverride ?? settings.chromeMode ?? false
-    if (chromeEnabled) {
-      options.claudeArgs = [...(options.claudeArgs || []), '--chrome']
-    }
+    // Help and version are pure queries: they must short-circuit BEFORE any
+    // runtime machinery — settings migration, ISCP profile resolution, auth,
+    // daemon spawn, session bootstrap. Version used to fall through into the
+    // normal flow "to pass --version to Claude Code"; under fail-fast profile
+    // resolution that auto-selected the single healthy ISCP profile and
+    // briefly started a real Agent session, so install/version probes left
+    // short-lived sessions behind. Query flags must have zero side effects.
 
     // Show help
     if (showHelp) {
@@ -782,7 +783,23 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
     // Show version
     if (showVersion) {
       console.log(`happy version: ${packageJson.version}`)
-      // Don't exit - continue to pass --version to Claude Code
+      // Still show Claude Code's version after ours, but via a direct
+      // one-shot exec — never by continuing into a Happy session.
+      try {
+        const claudeVersion = execFileSync(claudeCliPath, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 10_000 })
+        console.log(claudeVersion.trim())
+      } catch (e) {
+        // Claude missing or unresponsive: the happy version line above is the
+        // contract for probes; stay silent and side-effect free.
+      }
+      process.exit(0)
+    }
+
+    // Resolve Chrome mode: explicit flag > settings > false
+    const settings = await readSettings()
+    const chromeEnabled = chromeOverride ?? settings.chromeMode ?? false
+    if (chromeEnabled) {
+      options.claudeArgs = [...(options.claudeArgs || []), '--chrome']
     }
 
     // Normal flow - auth and machine setup

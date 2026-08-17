@@ -153,6 +153,19 @@ export class WireResponder {
     return running
   }
 
+  /**
+   * Liveness is the UNION of the child-process table and the registered
+   * session RPC bridges. After a daemon restart the agent process is not a
+   * child of the new daemon (it cannot be re-adopted — there is no
+   * ChildProcess handle and the registration carries no pid), but its
+   * lifetime heartbeat re-registers the RPC port; that registration is the
+   * daemon's authoritative proof of a reachable agent.
+   */
+  private isSessionLive(sessionId: string, running: Map<string, TrackedSession>): boolean {
+    return running.has(sessionId)
+      || this.deps.iscp.sessionRpcPort(this.deps.profileId, sessionId) !== null
+  }
+
   private sessionsList(): unknown {
     const log = this.deps.iscp.log(this.deps.profileId)
     const running = this.runningSessions()
@@ -167,10 +180,14 @@ export class WireResponder {
         ...(metadata.flavor !== undefined ? { agentType: metadata.flavor } : {}),
       })
     }
-    const known = new Set<string>([...running.keys(), ...log.listSessions()])
+    const known = new Set<string>([
+      ...running.keys(),
+      ...this.deps.iscp.sessionIdsWithRpcPort(this.deps.profileId),
+      ...log.listSessions(),
+    ])
     const sessions = [...known].map((sessionId) => {
       const info = log.sessionInfo(sessionId)
-      const active = running.has(sessionId)
+      const active = this.isSessionLive(sessionId, running)
       // Lifecycle contract for list consumers: show 'active' prominently,
       // fold 'idle' history away, and let 'archived' be safely hidden.
       const lifecycle = active ? 'active' : (info?.archived ?? false) ? 'archived' : 'idle'
@@ -194,7 +211,9 @@ export class WireResponder {
   private sessionsArchive(request: HappyWireRequest): HappyWireResponse {
     const params = SessionsArchiveParams.parse(request.params)
     const archived = params.archived ?? true
-    if (archived && this.runningSessions().has(params.sessionId)) {
+    // Same union as sessions.list: an agent that only re-registered via the
+    // heartbeat (daemon restarted) is still running and must not be archived.
+    if (archived && this.isSessionLive(params.sessionId, this.runningSessions())) {
       return failure(request.id, 'conflict', `session ${params.sessionId} is running; stop it before archiving`)
     }
     const found = this.deps.iscp.log(this.deps.profileId).setArchived(params.sessionId, archived)
@@ -306,7 +325,7 @@ export class WireResponder {
       // Distinguish "no such session" from "session exists but its agent
       // bridge is down": the latter is transient (heartbeat re-registers) and
       // must not be classified as a missing session by the caller.
-      const known = this.runningSessions().has(params.sessionId)
+      const known = this.isSessionLive(params.sessionId, this.runningSessions())
         || this.deps.iscp.log(this.deps.profileId).sessionInfo(params.sessionId) !== null
       if (!known) {
         return failure(request.id, 'not_found', `session ${params.sessionId} is unknown on this machine`)

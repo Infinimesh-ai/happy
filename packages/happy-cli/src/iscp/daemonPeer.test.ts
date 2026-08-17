@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { encodeTicketForTransport } from '@slopus/iscp'
+import { createDevice, createNobleProvider, encodeTicketForTransport } from '@slopus/iscp'
 
 import { CloudFixture } from '@/iscp/testing/cloudFixture'
 
@@ -160,7 +160,7 @@ describe('startDaemonIscpPeers listener lifecycle (real peers against the fixtur
     const iscp = new daemonIscp.DaemonIscpService()
     const peers = await daemonPeer.startDaemonIscpPeers(peerDeps(iscp))
     try {
-      // The fixture has no /v2/trust/devices/status route → 404 → fatal.
+      // The audience phone is not in the fixture trust directory → 404 → fatal.
       const deadline = Date.now() + 10_000
       let status = peers.statuses()[0]
       while (status !== undefined && status.session === 'connecting' && Date.now() < deadline) {
@@ -172,6 +172,34 @@ describe('startDaemonIscpPeers listener lifecycle (real peers against the fixtur
       expect(status!.sessionDetail).toBe('identity_unavailable')
     } finally {
       peers.stop()
+    }
+  }, 30_000)
+
+  it('the initiator resolves a registered audience phone through the slice-20 trust directory', async () => {
+    // OPS 2026-08-17 §12.3 e2e gate: the daemon's phone identity resolve must
+    // work against the production-shaped trust read contract, not only against
+    // enrollment/renewal fixtures.
+    const phone = createDevice(createNobleProvider(), { domainId: DOMAIN_ID, deviceId: PHONE_DEVICE_ID })
+    fixture.addTrustDevice(phone.identity)
+    try {
+      const iscp = new daemonIscp.DaemonIscpService()
+      const peers = await daemonPeer.startDaemonIscpPeers(peerDeps(iscp))
+      try {
+        const deadline = Date.now() + 3_000
+        let status = peers.statuses()[0]
+        while (status !== undefined && status.session === 'connecting' && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 25))
+          status = peers.statuses()[0]
+        }
+        expect(status).toBeDefined()
+        // Identity resolution succeeded; whatever the HTTP-only fixture does
+        // to the later WebSocket leg, the peer must not read as unresolvable.
+        expect(status!.sessionDetail).not.toBe('identity_unavailable')
+      } finally {
+        peers.stop()
+      }
+    } finally {
+      fixture.trustDevices.delete(PHONE_DEVICE_ID)
     }
   }, 30_000)
 })

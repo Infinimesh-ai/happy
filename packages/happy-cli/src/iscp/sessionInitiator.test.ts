@@ -58,6 +58,10 @@ describe('classifySessionFailure', () => {
     expect(classifySessionFailure(iscpError(IscpErrorCodes.TrustInvalid, 'device has been revoked'))).toEqual({ kind: 'fatal', category: 'revoked' })
     expect(classifySessionFailure(iscpError(IscpErrorCodes.TrustInvalid, 'trust grant is not currently valid'))).toEqual({ kind: 'fatal', category: 'grant_expired' })
     expect(classifySessionFailure(iscpError(IscpErrorCodes.AccessInvalid, 'device status failed with status 404'))).toEqual({ kind: 'fatal', category: 'identity_unavailable' })
+    // Only the device-status context reads as identity trouble: the same
+    // wire failure from any other call is a transport problem.
+    expect(classifySessionFailure(iscpError(IscpErrorCodes.AccessInvalid, 'device status failed with status 500'))).toEqual({ kind: 'fatal', category: 'identity_unavailable' })
+    expect(classifySessionFailure(iscpError(IscpErrorCodes.AccessInvalid, 'envelope submit failed with status 404'))).toEqual({ kind: 'fatal', category: 'transport_failed' })
     expect(classifySessionFailure(iscpError(IscpErrorCodes.AccessInvalid, 'access credential invalid'))).toEqual({ kind: 'fatal', category: 'transport_failed' })
     expect(classifySessionFailure(iscpError(IscpErrorCodes.EnvelopeInvalid, 'malformed envelope'))).toEqual({ kind: 'fatal', category: 'protocol_error' })
   })

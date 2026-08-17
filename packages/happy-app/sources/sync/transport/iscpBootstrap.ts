@@ -47,7 +47,7 @@ export async function createIscpTransportForProfile(profileId: string): Promise<
     const { descriptor: freshSigned } = await relayHttp.fetchSignedDescriptor();
     const relayDescriptor = verifyRelayDescriptor(provider, freshSigned);
 
-    const trustRoot = new TrustRootClient({ baseUrl: data.trustBaseUrl, trustRootId: data.trustRootId, provider });
+    const trustRoot = new TrustRootClient({ baseUrl: data.trustBaseUrl, trustRootId: data.trustRootId, domainId: data.domainId, provider });
 
     const link = createIscpPeerLink({
         agentDeviceId: data.agentDeviceId,

@@ -32,6 +32,29 @@ export const TrustDeviceRecordSchema = z.object({
 });
 export type TrustDeviceRecord = z.infer<typeof TrustDeviceRecordSchema>;
 
+/**
+ * Managed trust roots (Infinimesh Cloud, slice 20 frozen wire contract) wrap
+ * the grant-status response in an envelope instead of the reference's bare
+ * grant, and serve revocations as an `items` list instead of the reference's
+ * device-id → epoch map. The client accepts both shapes so one parser covers
+ * the ISCP reference stack and managed Cloud deployments.
+ */
+const GrantStatusEnvelopeSchema = z.object({
+  grant: TrustGrantSchema,
+  status: z.enum(['active', 'revoked', 'expired']),
+});
+
+const RevocationItemSchema = z.object({
+  revocation_id: z.string().min(1),
+  domain_id: z.string().min(1),
+  device_id: z.string().min(1).optional(),
+  grant_id: z.string().min(1).optional(),
+  reason_code: z.string(),
+  effective_at: z.string(),
+});
+const RevocationListSchema = z.object({ items: z.array(RevocationItemSchema) });
+const RevocationEpochMapSchema = z.record(z.string(), z.number().int().min(0));
+
 export interface VerifyGrantOptions {
   audience: string;
   subjectDeviceId: string;
@@ -108,6 +131,13 @@ export interface TrustRootClientOptions {
   fetchImpl?: FetchLike;
   /** Operator credential; required by the production profile for authorize/revoke/rotate. */
   adminToken?: string;
+  /**
+   * Tenant domain for managed trust roots. Multi-tenant deployments
+   * (Infinimesh Cloud) require it on every read query; the single-domain
+   * reference implementation ignores it. Always set it for managed profiles —
+   * the enrollment bundle carries the value.
+   */
+  domainId?: string;
   now?: () => Date;
 }
 
@@ -117,6 +147,7 @@ export class TrustRootClient {
   private readonly provider: CryptoProvider;
   private readonly fetchImpl: FetchLike;
   private readonly adminToken?: string;
+  private readonly domainId?: string;
   private readonly now: () => Date;
 
   constructor(opts: TrustRootClientOptions) {
@@ -125,7 +156,12 @@ export class TrustRootClient {
     this.provider = opts.provider;
     this.fetchImpl = opts.fetchImpl ?? ((url, init) => fetch(url, init));
     this.adminToken = opts.adminToken;
+    this.domainId = opts.domainId;
     this.now = opts.now ?? (() => new Date());
+  }
+
+  private domainQuery(prefix: '?' | '&'): string {
+    return this.domainId === undefined ? '' : `${prefix}domain_id=${encodeURIComponent(this.domainId)}`;
   }
 
   /** GET /.well-known/iscp/trust-root */
@@ -151,9 +187,15 @@ export class TrustRootClient {
     return TrustDeviceRecordSchema.parse(body);
   }
 
-  /** GET /v2/trust/devices/status?device_id=... */
+  /**
+   * GET /v2/trust/devices/status?device_id=...[&domain_id=...]
+   *
+   * Managed Cloud responses are a superset of the reference shape (flat
+   * compatibility fields beside the canonical nested `identity`); the
+   * non-strict record schema accepts both.
+   */
   async deviceStatus(deviceId: string): Promise<TrustDeviceRecord> {
-    const response = await this.fetchImpl(`${this.baseUrl}/v2/trust/devices/status?device_id=${encodeURIComponent(deviceId)}`);
+    const response = await this.fetchImpl(`${this.baseUrl}/v2/trust/devices/status?device_id=${encodeURIComponent(deviceId)}${this.domainQuery('&')}`);
     if (!response.ok) await parseError(response, 'device status');
     return TrustDeviceRecordSchema.parse(await response.json());
   }
@@ -225,18 +267,41 @@ export class TrustRootClient {
     return true;
   }
 
-  /** GET /v2/trust/grants/status?grant_id=... */
+  /**
+   * GET /v2/trust/grants/status?grant_id=...[&domain_id=...]
+   *
+   * Accepts the reference's bare grant and the managed `{grant, status}`
+   * envelope; the strict grant schema keeps the two unambiguous.
+   */
   async grantStatus(grantId: string): Promise<TrustGrant> {
-    const response = await this.fetchImpl(`${this.baseUrl}/v2/trust/grants/status?grant_id=${encodeURIComponent(grantId)}`);
+    const response = await this.fetchImpl(`${this.baseUrl}/v2/trust/grants/status?grant_id=${encodeURIComponent(grantId)}${this.domainQuery('&')}`);
     if (!response.ok) await parseError(response, 'grant status');
-    return TrustGrantSchema.parse(await response.json());
+    const body = z.union([GrantStatusEnvelopeSchema, TrustGrantSchema]).parse(await response.json());
+    return 'grant' in body ? body.grant : body;
   }
 
-  /** GET /v2/trust/revocations — device id → revocation epoch feed. */
+  /**
+   * GET /v2/trust/revocations[?domain_id=...] — device id → revocation epoch.
+   *
+   * Accepts the reference's epoch map and the managed `{items: [...]}` list.
+   * Managed device revocation is single-epoch, so a device-scoped item maps
+   * to epoch 1; grant-only items do not raise a device epoch and are dropped
+   * from this feed (grant lifecycle is read via grantStatus).
+   */
   async revocations(): Promise<Record<string, number>> {
-    const response = await this.fetchImpl(`${this.baseUrl}/v2/trust/revocations`);
+    const response = await this.fetchImpl(`${this.baseUrl}/v2/trust/revocations${this.domainQuery('?')}`);
     if (!response.ok) await parseError(response, 'revocations feed');
-    return z.record(z.string(), z.number().int().min(0)).parse(await response.json());
+    const body = z.union([RevocationListSchema, RevocationEpochMapSchema]).parse(await response.json());
+    if (!('items' in body) || !Array.isArray(body.items)) {
+      return body as Record<string, number>;
+    }
+    const epochs: Record<string, number> = {};
+    for (const item of body.items) {
+      if (item.device_id !== undefined) {
+        epochs[item.device_id] = Math.max(epochs[item.device_id] ?? 0, 1);
+      }
+    }
+    return epochs;
   }
 
   /** POST /v2/trust/keys/rotate (admin) — promotes the next signing key to active. */

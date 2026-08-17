@@ -59,7 +59,12 @@ export function classifySessionFailure(error: unknown): SessionFailureAction {
     if (error.code === IscpErrorCodes.TrustInvalid && (message.includes('expired') || message.includes('not currently valid'))) {
       return { kind: 'fatal', category: 'grant_expired' }
     }
-    if (error.code === IscpErrorCodes.AccessInvalid && (message.includes('status 404') || message.includes('not found') || message.includes('device status'))) {
+    // identity_unavailable is scoped to the peer-identity lookup: the trust
+    // client's parseError prefixes every deviceStatus failure with the stable
+    // 'device status' context. A 404 from any OTHER call (e.g. a relay route)
+    // must not read as an unresolvable peer — that misclassification hid the
+    // slice-20 trust contract fix behind a relay-side 404.
+    if (error.code === IscpErrorCodes.AccessInvalid && message.includes('device status')) {
       return { kind: 'fatal', category: 'identity_unavailable' }
     }
     if (error.code === IscpErrorCodes.AccessInvalid) return { kind: 'fatal', category: 'transport_failed' }

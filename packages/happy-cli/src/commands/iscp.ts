@@ -296,7 +296,7 @@ async function printCheckLayers(
   // ③ Cloud device record: existence + the Cloud-side key matches ours.
   try {
     const trustDescriptor = verifyTrustRootDescriptor(provider, bundle.trust_root_descriptor)
-    const trustRoot = new TrustRootClient({ baseUrl: trustDescriptor.base_url, trustRootId: bundle.trust_root_id, provider })
+    const trustRoot = new TrustRootClient({ baseUrl: trustDescriptor.base_url, trustRootId: bundle.trust_root_id, domainId: bundle.domain_id, provider })
     const record = await trustRoot.deviceStatus(bundle.device_identity.device_id)
     if (record.identity.public_key.kid === bundle.device_identity.public_key.kid) {
       console.log(`  [3] cloud device:   ${chalk.green('registered')} (status ${record.status}, key matches)`)
@@ -353,6 +353,7 @@ async function printOnlineGrantStatus(
     const trustRoot = new TrustRootClient({
       baseUrl: trustDescriptor.base_url,
       trustRootId: bundle.trust_root_id,
+      domainId: bundle.domain_id,
       provider,
     })
     const [liveGrant, revocations] = await Promise.all([

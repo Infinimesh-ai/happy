@@ -111,7 +111,7 @@ async function startProfilePeer(
   }
 
   const enrolledTrust = verifyTrustRootDescriptor(provider, bundle.trust_root_descriptor, { now: new Date(bundle.enrolled_at) })
-  const trustRoot = new TrustRootClient({ baseUrl: enrolledTrust.base_url, trustRootId: bundle.trust_root_id, provider })
+  const trustRoot = new TrustRootClient({ baseUrl: enrolledTrust.base_url, trustRootId: bundle.trust_root_id, domainId: bundle.domain_id, provider })
 
   const responder = new WireResponder({ ...deps, profileId })
   const subscribedPeers = new Set<string>()

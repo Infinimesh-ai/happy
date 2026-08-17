@@ -794,6 +794,7 @@ export async function startDaemon(): Promise<void> {
           }
 
           pidToTrackedSession.delete(pid);
+          iscp.unregisterSessionRpcPort(sessionId);
           logger.debug(`[DAEMON RUN] Removed session ${sessionId} from tracking`);
           return true;
         }
@@ -813,6 +814,9 @@ export async function startDaemon(): Promise<void> {
         logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
       }
       pidToTrackedSession.delete(pid);
+      if (session?.happySessionId) {
+        iscp.unregisterSessionRpcPort(session.happySessionId);
+      }
     };
 
     // ISCP dual-stack: event-log ingestion is always available; the ISCP
@@ -930,7 +934,7 @@ export async function startDaemon(): Promise<void> {
       }
 
       // Prune stale sessions
-      for (const [pid, _] of pidToTrackedSession.entries()) {
+      for (const [pid, session] of pidToTrackedSession.entries()) {
         try {
           // Check if process is still alive (signal 0 doesn't kill, just checks)
           process.kill(pid, 0);
@@ -938,6 +942,9 @@ export async function startDaemon(): Promise<void> {
           // Process is dead, remove from tracking
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
           pidToTrackedSession.delete(pid);
+          if (session.happySessionId) {
+            iscp.unregisterSessionRpcPort(session.happySessionId);
+          }
         }
       }
 

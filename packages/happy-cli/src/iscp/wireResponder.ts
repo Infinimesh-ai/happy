@@ -6,8 +6,12 @@
  *
  * Method catalog (transport-owned; unknown methods → 'unsupported'):
  *   sessions.list / sessions.spawn / sessions.stop
+ *   sessions.archive { sessionId, archived? } (history housekeeping; running → conflict)
  *   messages.pull { sessionId, afterCursor?, limit? }
- *   messages.send { sessionId, body }        (idempotencyKey required)
+ *   messages.send { sessionId, body }        (idempotencyKey required; 'retryable'
+ *                                             failure when the agent is unreachable —
+ *                                             the message stays persisted and a retry
+ *                                             with the same idempotencyKey redelivers)
  *   session.rpc   { sessionId, method, params }
  *   machine.rpc   { method, params }
  *   events.subscribe { }                     (live push flag; caller pulls backlog)
@@ -43,6 +47,11 @@ const SessionsSpawnParams = z.object({
 })
 
 const SessionsStopParams = z.object({ sessionId: z.string().min(1) })
+
+const SessionsArchiveParams = z.object({
+  sessionId: z.string().min(1),
+  archived: z.boolean().optional(),
+})
 
 const MessagesPullParams = z.object({
   sessionId: z.string().min(1),
@@ -87,6 +96,15 @@ export interface WireResponderDeps {
 export class WireResponder {
   constructor(private readonly deps: WireResponderDeps) {}
 
+  /**
+   * sessionId → localIds confirmed delivered to the agent process. Delivery
+   * (not persistence) is the success criterion for messages.send, so a
+   * deduped retry must re-forward until the agent has actually confirmed.
+   * In-memory only: after a daemon restart a retried send re-forwards, which
+   * is the safe direction (at-least-once toward the agent).
+   */
+  private readonly deliveredUserMessages = new Map<string, Set<string>>()
+
   async handle(request: HappyWireRequest): Promise<HappyWireResponse> {
     try {
       switch (request.method) {
@@ -98,6 +116,8 @@ export class WireResponder {
           const params = SessionsStopParams.parse(request.params)
           return success(request.id, { stopped: this.deps.stopSession(params.sessionId) })
         }
+        case 'sessions.archive':
+          return this.sessionsArchive(request)
         case 'messages.pull':
           return this.messagesPull(request)
         case 'messages.send':
@@ -125,24 +145,63 @@ export class WireResponder {
     }
   }
 
-  private sessionsList(): unknown {
-    const log = this.deps.iscp.log(this.deps.profileId)
+  private runningSessions(): Map<string, TrackedSession> {
     const running = new Map<string, TrackedSession>()
     for (const child of this.deps.getChildren()) {
       if (child.happySessionId !== undefined) running.set(child.happySessionId, child)
     }
+    return running
+  }
+
+  private sessionsList(): unknown {
+    const log = this.deps.iscp.log(this.deps.profileId)
+    const running = this.runningSessions()
+    // Persist display attributes while the process is alive, so history
+    // entries stay identifiable (not just an opaque id) after it exits.
+    for (const [sessionId, child] of running) {
+      const metadata = child.happySessionMetadataFromLocalWebhook
+      if (!metadata) continue
+      log.describe(sessionId, {
+        ...(metadata.name !== undefined ? { displayName: metadata.name } : {}),
+        directory: metadata.path,
+        ...(metadata.flavor !== undefined ? { agentType: metadata.flavor } : {}),
+      })
+    }
     const known = new Set<string>([...running.keys(), ...log.listSessions()])
     const sessions = [...known].map((sessionId) => {
       const info = log.sessionInfo(sessionId)
+      const active = running.has(sessionId)
+      // Lifecycle contract for list consumers: show 'active' prominently,
+      // fold 'idle' history away, and let 'archived' be safely hidden.
+      const lifecycle = active ? 'active' : (info?.archived ?? false) ? 'archived' : 'idle'
       return {
         sessionId,
-        active: running.has(sessionId),
+        active,
+        lifecycle,
         pid: running.get(sessionId)?.pid,
         lastSeq: info?.lastSeq ?? 0,
         lastCursor: info ? encodeWireCursor({ scope: sessionId, seq: info.lastSeq, epoch: info.epoch }) : undefined,
+        ...(info?.createdAt !== undefined ? { createdAt: info.createdAt } : {}),
+        ...(info?.lastActiveAt !== undefined ? { lastActiveAt: info.lastActiveAt } : {}),
+        ...(info?.displayName !== undefined ? { displayName: info.displayName } : {}),
+        ...(info?.directory !== undefined ? { directory: info.directory } : {}),
+        ...(info?.agentType !== undefined ? { agentType: info.agentType } : {}),
       }
     })
     return { sessions }
+  }
+
+  private sessionsArchive(request: HappyWireRequest): HappyWireResponse {
+    const params = SessionsArchiveParams.parse(request.params)
+    const archived = params.archived ?? true
+    if (archived && this.runningSessions().has(params.sessionId)) {
+      return failure(request.id, 'conflict', `session ${params.sessionId} is running; stop it before archiving`)
+    }
+    const found = this.deps.iscp.log(this.deps.profileId).setArchived(params.sessionId, archived)
+    if (!found) {
+      return failure(request.id, 'not_found', `session ${params.sessionId} has no history on this machine`)
+    }
+    return success(request.id, { sessionId: params.sessionId, archived })
   }
 
   private async sessionsSpawn(request: HappyWireRequest): Promise<HappyWireResponse> {
@@ -203,22 +262,39 @@ export class WireResponder {
 
   private async messagesSend(request: HappyWireRequest): Promise<HappyWireResponse> {
     const params = MessagesSendParams.parse(request.params)
-    if (request.idempotencyKey === undefined || request.idempotencyKey === '') {
+    const localId = request.idempotencyKey
+    if (localId === undefined || localId === '') {
       return failure(request.id, 'invalid', 'messages.send requires an idempotencyKey')
     }
+    // Persist first (idempotent outbox), but success means DELIVERED to the
+    // agent, not persisted: a send whose forward fails returns 'retryable'
+    // and the caller redelivers with the same idempotencyKey — the dedupe
+    // then reuses the stored seq while the forward is attempted again.
     const result = this.deps.iscp.ingest(this.deps.profileId, params.sessionId, [
-      { localId: request.idempotencyKey, body: params.body },
+      { localId, body: params.body },
     ])[0]
-    // Forward to the running session exactly once (dedupe suppresses redelivery).
-    if (!result.deduped) {
+    const alreadyDelivered = this.deliveredUserMessages.get(params.sessionId)?.has(localId) ?? false
+    if (!alreadyDelivered) {
       const delivered = await this.forwardToSession(params.sessionId, USER_MESSAGE_METHOD, params.body)
-      if (delivered !== null) {
-        logger.debug('[WIRE RESPONDER] user message forwarded', { sessionId: params.sessionId, seq: result.seq })
+      if (delivered === null || !delivered.ok) {
+        return failure(
+          request.id,
+          'retryable',
+          `session ${params.sessionId} agent is not reachable; the message is persisted — retry with the same idempotencyKey to deliver it`,
+        )
       }
+      let deliveredSet = this.deliveredUserMessages.get(params.sessionId)
+      if (!deliveredSet) {
+        deliveredSet = new Set()
+        this.deliveredUserMessages.set(params.sessionId, deliveredSet)
+      }
+      deliveredSet.add(localId)
+      logger.debug('[WIRE RESPONDER] user message delivered', { sessionId: params.sessionId, seq: result.seq })
     }
     return success(request.id, {
       seq: result.seq,
       deduped: result.deduped,
+      delivery: 'delivered',
       cursor: encodeWireCursor({ scope: params.sessionId, seq: result.seq, epoch: result.epoch }),
     })
   }
@@ -227,7 +303,15 @@ export class WireResponder {
     const params = SessionRpcParams.parse(request.params)
     const result = await this.forwardToSession(params.sessionId, params.method, params.params)
     if (result === null) {
-      return failure(request.id, 'not_found', `session ${params.sessionId} is not reachable`)
+      // Distinguish "no such session" from "session exists but its agent
+      // bridge is down": the latter is transient (heartbeat re-registers) and
+      // must not be classified as a missing session by the caller.
+      const known = this.runningSessions().has(params.sessionId)
+        || this.deps.iscp.log(this.deps.profileId).sessionInfo(params.sessionId) !== null
+      if (!known) {
+        return failure(request.id, 'not_found', `session ${params.sessionId} is unknown on this machine`)
+      }
+      return failure(request.id, 'retryable', `session ${params.sessionId} agent is not reachable`)
     }
     if (!result.ok) {
       return failure(request.id, 'invalid', result.error)
@@ -254,7 +338,7 @@ export class WireResponder {
     method: string,
     params: unknown,
   ): Promise<{ ok: true; result: unknown } | { ok: false; error: string } | null> {
-    const port = this.deps.iscp.sessionRpcPort(sessionId)
+    const port = this.deps.iscp.sessionRpcPort(this.deps.profileId, sessionId)
     if (port === null) return null
     const fetchImpl = this.deps.fetchImpl ?? fetch
     try {

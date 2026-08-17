@@ -15,6 +15,8 @@
  * with single-flight reload semantics for `POST /iscp/reload`.
  */
 
+import { randomUUID } from 'node:crypto'
+
 import {
   WIRE_EVENT_PAYLOAD_TYPE,
   WIRE_REQUEST_PAYLOAD_TYPE,
@@ -22,6 +24,7 @@ import {
   HappyWireRequestSchema,
   defaultAgentCapabilityManifest,
   encodeWireCursor,
+  type MachineWireEvent,
   type SessionWireEvent,
 } from '@slopus/happy-wire'
 import {
@@ -39,7 +42,7 @@ import {
 import { logger } from '@/ui/logger'
 import { listProfiles, readProfileBundle, readProfileDevice, updateProfileCredentials } from '@/iscp/enrollment'
 import { startSessionInitiator, type ProfilePeerStatus, type ProfileSessionState } from '@/iscp/sessionInitiator'
-import type { DaemonIscpService, SessionEventNotification } from '@/iscp/daemonIscp'
+import type { DaemonIscpService, SessionEventNotification, SessionLifecycleNotification } from '@/iscp/daemonIscp'
 import { WireResponder, type WireResponderDeps } from '@/iscp/wireResponder'
 
 export type { ProfilePeerStatus, ProfileSessionState } from '@/iscp/sessionInitiator'
@@ -171,6 +174,35 @@ async function startProfilePeer(
   // Live push: fan session-event notifications out to subscribed peers.
   // The handler reference is kept so stop() can remove it — otherwise every
   // reload doubles the pushes (listener leak).
+  // Session lifecycle push (session.added / agent reachable / unreachable):
+  // the app must not depend on polling sessions.list to notice that a spawned
+  // session's agent finished registering its RPC bridge. There is no machine
+  // event log to replay, so the cursor is ordering-only (per-peer epoch).
+  const machineEventEpoch = randomUUID()
+  let machineEventSeq = 0
+  const onSessionLifecycle = (notification: SessionLifecycleNotification) => {
+    if (notification.profileId !== profileId) return
+    machineEventSeq += 1
+    const event: MachineWireEvent = {
+      type: 'machine-event',
+      machineId: device.identity.device_id,
+      cursor: encodeWireCursor({ scope: `machine:${device.identity.device_id}`, seq: machineEventSeq, epoch: machineEventEpoch }),
+      body: {
+        kind: 'session.lifecycle',
+        sessionId: notification.sessionId,
+        change: notification.change,
+        reason: notification.reason,
+        at: Date.now(),
+      },
+    }
+    for (const peerDeviceId of subscribedPeers) {
+      peer.sendPayload(peerDeviceId, WIRE_EVENT_PAYLOAD_TYPE, utf8Encode(JSON.stringify(event))).catch((error) => {
+        logger.debug('[ISCP PEER] lifecycle push failed', { peerDeviceId, error })
+      })
+    }
+  }
+  deps.iscp.events.on('session-lifecycle', onSessionLifecycle)
+
   const onSessionEvent = (notification: SessionEventNotification) => {
     if (notification.profileId !== profileId || notification.deduped) return
     const event: SessionWireEvent = {
@@ -224,6 +256,7 @@ async function startProfilePeer(
       // Settle any pending openSession so the loop terminates promptly.
       peer.closeSession(audience)
       deps.iscp.events.off('session-event', onSessionEvent)
+      deps.iscp.events.off('session-lifecycle', onSessionLifecycle)
       peer.stop()
     },
   }

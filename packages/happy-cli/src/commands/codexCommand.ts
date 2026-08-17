@@ -3,6 +3,7 @@ import { runCodex } from '@/codex/runCodex'
 import { extractCodexResumeFlag } from '@/codex/cliArgs'
 import { extractNoSandboxFlag } from '@/utils/sandboxFlags'
 import { ensureDaemonRunning } from '@/daemon/ensureDaemonRunning'
+import { ensureIscpProfileEnv } from '@/iscp/profileEnv'
 import type { PermissionMode } from '@/api/types'
 import type { ReasoningEffort } from '@/codex/codexAppServerTypes'
 
@@ -27,6 +28,10 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
       permissionMode = 'yolo'
     }
   }
+
+  // Fail fast before spawning: a terminal launch without a resolved ISCP
+  // profile would be listed by the daemon yet unreachable from the app.
+  ensureIscpProfileEnv('happy codex', startedBy)
 
   const { credentials } = await authAndSetupMachineIfNeeded()
   await ensureDaemonRunning()

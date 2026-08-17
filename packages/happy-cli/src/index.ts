@@ -786,6 +786,15 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
     }
 
     // Normal flow - auth and machine setup
+    try {
+      // Fail fast before spawning: a terminal launch without a resolved ISCP
+      // profile would be listed by the daemon yet unreachable from the app.
+      const { ensureIscpProfileEnv } = await import('@/iscp/profileEnv');
+      ensureIscpProfileEnv('happy', options.startedBy);
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+      process.exit(1)
+    }
     const {
       credentials
     } = await authAndSetupMachineIfNeeded();

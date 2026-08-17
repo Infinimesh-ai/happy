@@ -6,8 +6,11 @@
  * iscp_session_v1 on the relay.
  *
  * The session registers its port with the daemon control server
- * (POST /iscp/session-rpc) right after listening, and re-registers with
- * retries so a daemon restart re-learns the port.
+ * (POST /iscp/session-rpc) and keeps re-registering on a heartbeat for the
+ * whole session lifetime: the daemon's port table is in-memory only, so a
+ * daemon restart at any point (not just the startup window) must re-learn
+ * the port within one heartbeat interval. Registration is idempotent on the
+ * daemon side; unreachable daemons are retried on a tighter interval.
  */
 
 import fastify from 'fastify'
@@ -16,10 +19,9 @@ import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-
 
 import { daemonPost } from '@/daemon/controlClient'
 import { logger } from '@/ui/logger'
-import { delay } from '@/utils/time'
 
 const REGISTER_RETRY_INTERVAL_MS = 2000
-const REGISTER_RETRY_LIMIT = 30
+const REGISTER_HEARTBEAT_INTERVAL_MS = 15_000
 
 export const USER_MESSAGE_METHOD = 'iscp.user-message'
 
@@ -33,6 +35,9 @@ export async function startIscpSessionRpcServer(opts: {
   sessionId: string
   onUserMessage: (body: unknown) => void
   callHandler: (method: string, params: unknown) => Promise<unknown>
+  /** Injectable for tests. */
+  retryIntervalMs?: number
+  heartbeatIntervalMs?: number
 }): Promise<IscpSessionRpcServer> {
   const app = fastify({ logger: false })
   app.setValidatorCompiler(validatorCompiler)
@@ -82,26 +87,51 @@ export async function startIscpSessionRpcServer(opts: {
   })
   logger.debug(`[ISCP SESSION RPC] Listening on 127.0.0.1:${port} for session ${opts.sessionId}`)
 
-  // Register with the daemon (retry: we may race a daemon restart).
-  void (async () => {
-    for (let attempt = 0; attempt < REGISTER_RETRY_LIMIT; attempt++) {
+  // Registration heartbeat: never stops while the session lives. A success
+  // only means the *current* daemon knows the port; the next daemon won't.
+  const retryMs = opts.retryIntervalMs ?? REGISTER_RETRY_INTERVAL_MS
+  const heartbeatMs = opts.heartbeatIntervalMs ?? REGISTER_HEARTBEAT_INTERVAL_MS
+  let stopped = false
+  let wake: (() => void) | null = null
+  const sleep = (ms: number) => new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      wake = null
+      resolve()
+    }, ms)
+    timer.unref?.()
+    wake = () => {
+      clearTimeout(timer)
+      wake = null
+      resolve()
+    }
+  })
+
+  const heartbeat = (async () => {
+    let registered = false
+    while (!stopped) {
       const result = await daemonPost('/iscp/session-rpc', {
         profileId: opts.profileId,
         sessionId: opts.sessionId,
         port
       })
-      if (!result?.error) {
+      const ok = !result?.error
+      if (ok && !registered) {
         logger.debug(`[ISCP SESSION RPC] Registered with daemon for session ${opts.sessionId}`)
-        return
+      } else if (!ok && registered) {
+        logger.debug(`[ISCP SESSION RPC] Daemon unreachable for session ${opts.sessionId}; retrying until it returns`)
       }
-      await delay(REGISTER_RETRY_INTERVAL_MS)
+      registered = ok
+      if (stopped) break
+      await sleep(ok ? heartbeatMs : retryMs)
     }
-    logger.debug(`[ISCP SESSION RPC] Failed to register with daemon for session ${opts.sessionId}`)
   })()
 
   return {
     port,
     stop: async () => {
+      stopped = true
+      wake?.()
+      await heartbeat
       await app.close()
     }
   }

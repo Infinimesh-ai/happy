@@ -73,6 +73,49 @@ describe('DaemonEventLog', () => {
     expect(reloaded.append('sess', { t: 'c' }).seq).toBe(3)
   })
 
+  it('tracks lifecycle metadata: createdAt, lastActiveAt, describe, archive', () => {
+    const log = new DaemonEventLog(root)
+    const before = Date.now()
+    log.append('sess', { t: 'a' })
+    const info = log.sessionInfo('sess')!
+    expect(info.createdAt).toBeGreaterThanOrEqual(before)
+    expect(info.lastActiveAt).toBeGreaterThanOrEqual(before)
+
+    log.describe('sess', { displayName: 'My Session', directory: '/tmp/proj', agentType: 'codex' })
+    expect(log.setArchived('sess', true)).toBe(true)
+    expect(log.setArchived('missing', true)).toBe(false)
+
+    // All lifecycle fields survive a reload (persisted in meta.json).
+    const reloaded = new DaemonEventLog(root)
+    const meta = reloaded.sessionInfo('sess')!
+    expect(meta).toMatchObject({
+      displayName: 'My Session',
+      directory: '/tmp/proj',
+      agentType: 'codex',
+      archived: true,
+    })
+    expect(meta.createdAt).toBe(info.createdAt)
+  })
+
+  it('parses pre-lifecycle meta.json written before the additive fields existed', () => {
+    const log = new DaemonEventLog(root)
+    log.append('sess', { t: 'a' })
+    // Rewrite meta in the legacy {epoch, lastSeq} shape.
+    const metaFile = join(root, 'sessions', 'sess', 'meta.json')
+    const meta = JSON.parse(readFileSync(metaFile, 'utf8'))
+    writeFileSync(metaFile, JSON.stringify({ epoch: meta.epoch, lastSeq: meta.lastSeq }))
+
+    const reloaded = new DaemonEventLog(root)
+    const info = reloaded.sessionInfo('sess')!
+    expect(info.epoch).toBe(meta.epoch)
+    expect(info.createdAt).toBeUndefined()
+    expect(info.archived).toBeUndefined()
+    // Appending upgrades the meta in place without touching the epoch.
+    reloaded.append('sess', { t: 'b' })
+    expect(reloaded.sessionInfo('sess')!.lastActiveAt).toBeDefined()
+    expect(reloaded.sessionInfo('sess')!.epoch).toBe(meta.epoch)
+  })
+
   it('lists sessions and rejects path-traversal session ids', () => {
     const log = new DaemonEventLog(root)
     log.append('sess-a', {})

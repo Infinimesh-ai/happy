@@ -24,22 +24,62 @@ export interface SessionEventNotification {
   deduped: boolean
 }
 
+export interface SessionLifecycleNotification {
+  profileId: string
+  sessionId: string
+  change: 'added' | 'changed'
+  reason: 'session_created' | 'agent_reachable' | 'agent_unreachable'
+}
+
 export class DaemonIscpService {
   /** Injectable for tests; defaults to the enrolled profile directory. */
   constructor(private readonly profileDirFor: (profileId: string) => string = iscpProfileDir) {}
 
   private readonly logs = new Map<string, DaemonEventLog>()
-  /** Emits 'session-event' with SessionEventNotification for live subscribers. */
+  /**
+   * Emits 'session-event' with SessionEventNotification and
+   * 'session-lifecycle' with SessionLifecycleNotification for live subscribers.
+   */
   readonly events = new EventEmitter()
   /** sessionId → localhost RPC port of the running ISCP session process. */
   private readonly sessionRpcPorts = new Map<string, { profileId: string; port: number }>()
 
-  registerSessionRpcPort(profileId: string, sessionId: string, port: number): void {
+  /**
+   * Sessions re-register on a heartbeat, so an unchanged registration is the
+   * steady state; only changes are worth logging or pushing to peers.
+   * Returns true when the registration is new or the port moved.
+   */
+  registerSessionRpcPort(profileId: string, sessionId: string, port: number): boolean {
+    const existing = this.sessionRpcPorts.get(sessionId)
+    if (existing?.profileId === profileId && existing.port === port) return false
     this.sessionRpcPorts.set(sessionId, { profileId, port })
+    this.events.emit('session-lifecycle', {
+      profileId,
+      sessionId,
+      change: 'changed',
+      reason: 'agent_reachable',
+    } satisfies SessionLifecycleNotification)
+    return true
   }
 
-  sessionRpcPort(sessionId: string): number | null {
-    return this.sessionRpcPorts.get(sessionId)?.port ?? null
+  /** Drop a registration when the session process exits (agent unreachable). */
+  unregisterSessionRpcPort(sessionId: string): void {
+    const existing = this.sessionRpcPorts.get(sessionId)
+    if (!existing) return
+    this.sessionRpcPorts.delete(sessionId)
+    this.events.emit('session-lifecycle', {
+      profileId: existing.profileId,
+      sessionId,
+      change: 'changed',
+      reason: 'agent_unreachable',
+    } satisfies SessionLifecycleNotification)
+  }
+
+  /** The port is scoped to the owning profile: no cross-profile resolution. */
+  sessionRpcPort(profileId: string, sessionId: string): number | null {
+    const entry = this.sessionRpcPorts.get(sessionId)
+    if (!entry || entry.profileId !== profileId) return null
+    return entry.port
   }
 
   log(profileId: string): DaemonEventLog {
@@ -57,6 +97,7 @@ export class DaemonIscpService {
   /** Ingest a batch of session events (idempotent per localId). */
   ingest(profileId: string, sessionId: string, events: IngestedSessionEvent[]): EventLogAppendResult[] {
     const log = this.log(profileId)
+    const isNewSession = log.sessionInfo(sessionId) === null
     const results: EventLogAppendResult[] = []
     for (const event of events) {
       const result = log.append(sessionId, event.body, event.localId)
@@ -68,6 +109,14 @@ export class DaemonIscpService {
         epoch: result.epoch,
         deduped: result.deduped,
       } satisfies SessionEventNotification)
+    }
+    if (isNewSession && events.length > 0) {
+      this.events.emit('session-lifecycle', {
+        profileId,
+        sessionId,
+        change: 'added',
+        reason: 'session_created',
+      } satisfies SessionLifecycleNotification)
     }
     return results
   }

@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { decodeWireCursor } from '@slopus/happy-wire'
 
 import { DaemonIscpService } from './daemonIscp'
-import { WireResponder } from './wireResponder'
+import { WireResponder, type WireResponderDeps } from './wireResponder'
+import type { TrackedSession } from '@/daemon/types'
 
 
 describe('WireResponder', () => {
@@ -16,30 +17,45 @@ describe('WireResponder', () => {
   const spawnSession = vi.fn(async () => ({ type: 'success' as const, sessionId: 'sess-new' }))
   const stopSession = vi.fn(() => true)
 
+  const okFetch = vi.fn(async () => new Response(JSON.stringify({ ok: true, result: null }), { status: 200 }))
+  const downFetch = vi.fn(async () => {
+    throw new Error('connect ECONNREFUSED')
+  })
+
+  const build = (overrides?: Partial<WireResponderDeps>) => new WireResponder({
+    iscp,
+    profileId: 'p1',
+    getChildren: () => [],
+    stopSession,
+    spawnSession,
+    ...overrides,
+  })
+
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'iscp-wire-'))
     iscp = new DaemonIscpService((profileId) => join(root, profileId))
-    responder = new WireResponder({
-      iscp,
-      profileId: 'p1',
-      getChildren: () => [],
-      stopSession,
-      spawnSession,
-    })
+    responder = build()
     spawnSession.mockClear()
+    okFetch.mockClear()
+    downFetch.mockClear()
   })
   afterEach(() => {
     rmSync(root, { recursive: true, force: true })
   })
 
-  it('messages.send requires idempotencyKey and dedupes resends', async () => {
+  it('messages.send requires idempotencyKey and dedupes delivered resends', async () => {
+    iscp.registerSessionRpcPort('p1', 's1', 4242)
+    responder = build({ fetchImpl: okFetch as unknown as typeof fetch })
+
     const missing = await responder.handle({ id: 'r1', method: 'messages.send', params: { sessionId: 's1', body: { t: 'hi' } } })
     expect(missing).toMatchObject({ ok: false, error: { code: 'invalid' } })
 
     const first = await responder.handle({ id: 'r2', method: 'messages.send', params: { sessionId: 's1', body: { t: 'hi' } }, idempotencyKey: 'k1' })
     const retry = await responder.handle({ id: 'r3', method: 'messages.send', params: { sessionId: 's1', body: { t: 'hi' } }, idempotencyKey: 'k1' })
-    expect(first).toMatchObject({ ok: true, result: { seq: 1, deduped: false } })
-    expect(retry).toMatchObject({ ok: true, result: { seq: 1, deduped: true } })
+    expect(first).toMatchObject({ ok: true, result: { seq: 1, deduped: false, delivery: 'delivered' } })
+    expect(retry).toMatchObject({ ok: true, result: { seq: 1, deduped: true, delivery: 'delivered' } })
+    // Confirmed-delivered dedupe does NOT re-forward.
+    expect(okFetch).toHaveBeenCalledTimes(1)
 
     const pull = await responder.handle({ id: 'r4', method: 'messages.pull', params: { sessionId: 's1' } })
     expect(pull.ok).toBe(true)
@@ -47,7 +63,39 @@ describe('WireResponder', () => {
     expect(result.events).toHaveLength(1)
   })
 
+  it('messages.send fails retryable when the agent is unreachable, then redelivers on retry', async () => {
+    // No RPC port registered at all → persisted but not delivered.
+    const noBridge = await responder.handle({ id: 'r1', method: 'messages.send', params: { sessionId: 's1', body: { t: 'hi' } }, idempotencyKey: 'k1' })
+    expect(noBridge).toMatchObject({ ok: false, error: { code: 'retryable' } })
+    // The idempotent outbox kept the message.
+    const pull = await responder.handle({ id: 'r2', method: 'messages.pull', params: { sessionId: 's1' } })
+    expect((pull as { ok: true; result: { events: unknown[] } }).result.events).toHaveLength(1)
+
+    // Bridge up but fetch fails → still retryable.
+    iscp.registerSessionRpcPort('p1', 's1', 4242)
+    responder = build({ fetchImpl: downFetch as unknown as typeof fetch })
+    const stillDown = await responder.handle({ id: 'r3', method: 'messages.send', params: { sessionId: 's1', body: { t: 'hi' } }, idempotencyKey: 'k1' })
+    expect(stillDown).toMatchObject({ ok: false, error: { code: 'retryable' } })
+
+    // Agent back → the SAME idempotencyKey now delivers (dedupe reuses seq 1
+    // but the forward is re-attempted, not suppressed by the outbox).
+    responder = build({ fetchImpl: okFetch as unknown as typeof fetch })
+    const delivered = await responder.handle({ id: 'r4', method: 'messages.send', params: { sessionId: 's1', body: { t: 'hi' } }, idempotencyKey: 'k1' })
+    expect(delivered).toMatchObject({ ok: true, result: { seq: 1, deduped: true, delivery: 'delivered' } })
+    expect(okFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('messages.send does not resolve a port registered by another profile', async () => {
+    iscp.registerSessionRpcPort('p2', 's1', 4242)
+    responder = build({ fetchImpl: okFetch as unknown as typeof fetch })
+    const response = await responder.handle({ id: 'r1', method: 'messages.send', params: { sessionId: 's1', body: {} }, idempotencyKey: 'k1' })
+    expect(response).toMatchObject({ ok: false, error: { code: 'retryable' } })
+    expect(okFetch).not.toHaveBeenCalled()
+  })
+
   it('messages.pull resumes from a cursor and flags stale-epoch resets', async () => {
+    iscp.registerSessionRpcPort('p1', 's1', 4242)
+    responder = build({ fetchImpl: okFetch as unknown as typeof fetch })
     await responder.handle({ id: 'a', method: 'messages.send', params: { sessionId: 's1', body: { n: 1 } }, idempotencyKey: 'k1' })
     await responder.handle({ id: 'b', method: 'messages.send', params: { sessionId: 's1', body: { n: 2 } }, idempotencyKey: 'k2' })
     const page1 = await responder.handle({ id: 'c', method: 'messages.pull', params: { sessionId: 's1', limit: 1 } })
@@ -77,13 +125,77 @@ describe('WireResponder', () => {
     }))
   })
 
+  it('sessions.list exposes lifecycle, last-active and display attributes', async () => {
+    const child: TrackedSession = {
+      startedBy: 'daemon',
+      happySessionId: 'sess-live',
+      pid: 4321,
+      happySessionMetadataFromLocalWebhook: {
+        path: '/tmp/proj',
+        host: 'localhost',
+        name: 'My Project',
+        flavor: 'codex',
+        homeDir: '/home/u',
+        happyHomeDir: '/home/u/.happy',
+        happyLibDir: '/home/u/.happy/lib',
+        happyToolsDir: '/home/u/.happy/tools',
+      },
+    }
+    responder = build({ getChildren: () => [child] })
+    // Historical sessions: one idle, one archived.
+    iscp.ingest('p1', 'sess-old', [{ body: { t: 'x' } }])
+    iscp.ingest('p1', 'sess-archived', [{ body: { t: 'y' } }])
+    iscp.log('p1').setArchived('sess-archived', true)
+
+    const response = await responder.handle({ id: 'l', method: 'sessions.list', params: {} })
+    const { sessions } = (response as { ok: true; result: { sessions: Array<Record<string, unknown>> } }).result
+    const byId = new Map(sessions.map((s) => [s.sessionId, s]))
+    expect(byId.get('sess-live')).toMatchObject({
+      active: true,
+      lifecycle: 'active',
+      displayName: 'My Project',
+      directory: '/tmp/proj',
+      agentType: 'codex',
+    })
+    expect(byId.get('sess-old')).toMatchObject({ active: false, lifecycle: 'idle' })
+    expect(byId.get('sess-old')!.lastActiveAt).toBeDefined()
+    expect(byId.get('sess-archived')).toMatchObject({ active: false, lifecycle: 'archived' })
+
+    // Display attributes were persisted: they survive the process exiting.
+    responder = build({ getChildren: () => [] })
+    const after = await responder.handle({ id: 'l2', method: 'sessions.list', params: {} })
+    const gone = (after as { ok: true; result: { sessions: Array<Record<string, unknown>> } }).result.sessions
+      .find((s) => s.sessionId === 'sess-live')
+    expect(gone).toMatchObject({ active: false, lifecycle: 'idle', displayName: 'My Project' })
+  })
+
+  it('sessions.archive folds history away and refuses running sessions', async () => {
+    const child: TrackedSession = { startedBy: 'daemon', happySessionId: 'sess-live', pid: 1 }
+    responder = build({ getChildren: () => [child] })
+    iscp.ingest('p1', 'sess-old', [{ body: {} }])
+
+    expect(await responder.handle({ id: 'a', method: 'sessions.archive', params: { sessionId: 'sess-live' } }))
+      .toMatchObject({ ok: false, error: { code: 'conflict' } })
+    expect(await responder.handle({ id: 'b', method: 'sessions.archive', params: { sessionId: 'ghost' } }))
+      .toMatchObject({ ok: false, error: { code: 'not_found' } })
+    expect(await responder.handle({ id: 'c', method: 'sessions.archive', params: { sessionId: 'sess-old' } }))
+      .toMatchObject({ ok: true, result: { sessionId: 'sess-old', archived: true } })
+    expect(await responder.handle({ id: 'd', method: 'sessions.archive', params: { sessionId: 'sess-old', archived: false } }))
+      .toMatchObject({ ok: true, result: { archived: false } })
+  })
+
   it('rejects unknown methods as unsupported and keeps wakeup.v1 as a hook point', async () => {
     expect(await responder.handle({ id: 'x', method: 'nope', params: {} })).toMatchObject({ ok: false, error: { code: 'unsupported' } })
     expect(await responder.handle({ id: 'w', method: 'wakeup.v1', params: {} })).toMatchObject({ ok: false, error: { code: 'unsupported' } })
   })
 
-  it('session.rpc returns not_found when the session bridge is offline', async () => {
-    const response = await responder.handle({ id: 'r', method: 'session.rpc', params: { sessionId: 'ghost', method: 'abort', params: {} } })
-    expect(response).toMatchObject({ ok: false, error: { code: 'not_found' } })
+  it('session.rpc separates unknown sessions from unreachable agents', async () => {
+    const unknown = await responder.handle({ id: 'r', method: 'session.rpc', params: { sessionId: 'ghost', method: 'abort', params: {} } })
+    expect(unknown).toMatchObject({ ok: false, error: { code: 'not_found' } })
+
+    // Session with history but no registered bridge → transient, retryable.
+    iscp.ingest('p1', 'sess-known', [{ body: {} }])
+    const offline = await responder.handle({ id: 'r2', method: 'session.rpc', params: { sessionId: 'sess-known', method: 'abort', params: {} } })
+    expect(offline).toMatchObject({ ok: false, error: { code: 'retryable' } })
   })
 })

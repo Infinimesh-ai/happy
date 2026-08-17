@@ -5,7 +5,7 @@
  *
  * Layout (under ~/.happy/iscp/<profileId>/eventlog/):
  *   sessions/<sessionId>/log.jsonl   append-only, one JSON record per line
- *   sessions/<sessionId>/meta.json   { epoch, lastSeq } (atomic rename write)
+ *   sessions/<sessionId>/meta.json   { epoch, lastSeq, ...lifecycle } (atomic rename write)
  *
  * Guarantees:
  * - seq is monotonically increasing per session, assigned by this log;
@@ -41,17 +41,30 @@ export interface EventLogReadResult {
   hasMore: boolean
 }
 
-interface SessionLogState {
+export interface SessionDescription {
+  displayName?: string
+  directory?: string
+  agentType?: string
+}
+
+export interface SessionMeta extends SessionDescription {
   epoch: string
   lastSeq: number
+  createdAt?: number
+  lastActiveAt?: number
+  archived?: boolean
+}
+
+interface SessionLogState extends SessionMeta {
   /** localId → seq for idempotent appends. */
   localIds: Map<string, number>
 }
 
-interface SessionMetaFile {
-  epoch: string
-  lastSeq: number
-}
+/**
+ * On-disk meta.json. All fields beyond {epoch, lastSeq} are additive and
+ * optional: logs written before the lifecycle fields existed parse unchanged.
+ */
+type SessionMetaFile = SessionMeta
 
 export class DaemonEventLog {
   private readonly sessions = new Map<string, SessionLogState>()
@@ -77,14 +90,14 @@ export class DaemonEventLog {
     if (!existsSync(metaFile)) {
       if (!createIfMissing) return null
       mkdirSync(dir, { recursive: true, mode: 0o700 })
-      const fresh: SessionLogState = { epoch: randomUUID(), lastSeq: 0, localIds: new Map() }
+      const fresh: SessionLogState = { epoch: randomUUID(), lastSeq: 0, createdAt: Date.now(), localIds: new Map() }
       this.writeMeta(sessionId, fresh)
       this.sessions.set(sessionId, fresh)
       return fresh
     }
 
     const meta = JSON.parse(readFileSync(metaFile, 'utf8')) as SessionMetaFile
-    const state: SessionLogState = { epoch: meta.epoch, lastSeq: meta.lastSeq, localIds: new Map() }
+    const state: SessionLogState = { ...meta, localIds: new Map() }
     // Rebuild the dedupe index (and recover lastSeq if meta lagged a crash —
     // the log line is appended before meta is rewritten).
     if (existsSync(logFile)) {
@@ -103,8 +116,8 @@ export class DaemonEventLog {
     const dir = this.sessionDir(sessionId)
     const metaFile = join(dir, 'meta.json')
     const tmpFile = metaFile + '.tmp'
-    const meta: SessionMetaFile = { epoch: state.epoch, lastSeq: state.lastSeq }
-    writeFileSync(tmpFile, JSON.stringify(meta), { mode: 0o600 })
+    const { localIds: _localIds, ...meta } = state
+    writeFileSync(tmpFile, JSON.stringify(meta satisfies SessionMetaFile), { mode: 0o600 })
     renameSync(tmpFile, metaFile)
   }
 
@@ -126,9 +139,39 @@ export class DaemonEventLog {
     }
     appendFileSync(join(this.sessionDir(sessionId), 'log.jsonl'), JSON.stringify(record) + '\n', { mode: 0o600 })
     state.lastSeq = seq
+    state.lastActiveAt = record.at
     if (localId !== undefined) state.localIds.set(localId, seq)
     this.writeMeta(sessionId, state)
     return { seq, epoch: state.epoch, deduped: false }
+  }
+
+  /**
+   * Persist display attributes so history entries stay identifiable after the
+   * process exits. Creates the log if needed (a spawned session may be
+   * described before its first event). No-op when nothing changes.
+   */
+  describe(sessionId: string, description: SessionDescription): void {
+    const state = this.state(sessionId, true)!
+    let changed = false
+    for (const key of ['displayName', 'directory', 'agentType'] as const) {
+      const value = description[key]
+      if (value !== undefined && state[key] !== value) {
+        state[key] = value
+        changed = true
+      }
+    }
+    if (changed) this.writeMeta(sessionId, state)
+  }
+
+  /** Mark a historical session as archived (or restore it). */
+  setArchived(sessionId: string, archived: boolean): boolean {
+    const state = this.state(sessionId, false)
+    if (!state) return false
+    if ((state.archived ?? false) !== archived) {
+      state.archived = archived
+      this.writeMeta(sessionId, state)
+    }
+    return true
   }
 
   /** Read events with seq > afterSeq, up to limit. */
@@ -154,9 +197,11 @@ export class DaemonEventLog {
   }
 
   /** Session metadata without reading the log body. */
-  sessionInfo(sessionId: string): { epoch: string; lastSeq: number } | null {
+  sessionInfo(sessionId: string): SessionMeta | null {
     const state = this.state(sessionId, false)
-    return state ? { epoch: state.epoch, lastSeq: state.lastSeq } : null
+    if (!state) return null
+    const { localIds: _localIds, ...meta } = state
+    return meta
   }
 
   listSessions(): string[] {

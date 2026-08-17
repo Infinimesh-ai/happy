@@ -271,8 +271,10 @@ export function startDaemonControlServer({
         return { error: 'ISCP is not enabled on this daemon' };
       }
       const { profileId, sessionId, port } = request.body;
-      iscp.registerSessionRpcPort(profileId, sessionId, port);
-      logger.debug(`[CONTROL SERVER] ISCP session RPC registered: ${sessionId} → 127.0.0.1:${port}`);
+      // Sessions re-register on a heartbeat; only log actual changes.
+      if (iscp.registerSessionRpcPort(profileId, sessionId, port)) {
+        logger.debug(`[CONTROL SERVER] ISCP session RPC registered: ${sessionId} → 127.0.0.1:${port}`);
+      }
       return { status: 'ok' as const };
     });
 

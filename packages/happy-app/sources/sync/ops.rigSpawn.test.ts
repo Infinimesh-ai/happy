@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { machineRPC } = vi.hoisted(() => ({ machineRPC: vi.fn() }));
 
-vi.mock('./apiSocket', () => ({ apiSocket: { machineRPC } }));
+vi.mock('./transport/transport', () => ({ machineRPC }));
 vi.mock('./sync', () => ({ sync: {} }));
 vi.mock('./storage', () => ({ storage: { getState: vi.fn() } }));
 

@@ -21,6 +21,7 @@ import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stop
 import { startDaemonControlServer } from './controlServer';
 import { DaemonIscpService } from '@/iscp/daemonIscp';
 import { createIscpPeersController, startDaemonIscpPeers } from '@/iscp/daemonPeer';
+import { startDaemonAutoRenewal } from '@/iscp/autoRenewal';
 import { statSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
@@ -867,6 +868,16 @@ export async function startDaemon(): Promise<void> {
       logger.debug('[DAEMON RUN] ISCP peer startup failed', { error });
     }
 
+    // ISCP bounded auto-renewal (OPS 2026-08-17 §8.3/§8.4): the daemon — not
+    // the phone app or a session — keeps every enrolled profile's trust grant
+    // fresh, recovering persisted in-flight attempts across daemon restarts.
+    // Deliberately independent of the peers: a profile whose peer failed to
+    // start must still renew its grant.
+    const autoRenewal = startDaemonAutoRenewal({
+      reloadPeers: () => iscpPeers.reload(),
+      log: (line) => logger.debug(`[ISCP AUTO-RENEW] ${line}`),
+    });
+
     // Capture the bundled CLI's mtime at startup so the heartbeat can detect
     // when npm replaces `dist/index.mjs` on disk (= the user ran `npm i -g happy`).
     // We previously compared disk `package.json.version` to our bundled version,
@@ -972,6 +983,7 @@ export async function startDaemon(): Promise<void> {
         // `happy daemon start` reads our still-present daemon.state.json, sees
         // isDaemonRunningCurrentlyInstalledHappyVersion() === true, and exits —
         // leaving nothing running once we also exit.
+        autoRenewal.stop();
         iscpPeers.stop();
         apiMachine.shutdown();
         await stopControlServer();
@@ -1042,6 +1054,7 @@ export async function startDaemon(): Promise<void> {
       // Give time for metadata update to send
       await new Promise(resolve => setTimeout(resolve, 100));
 
+      autoRenewal.stop();
       iscpPeers.stop();
       apiMachine.shutdown();
       await stopControlServer();

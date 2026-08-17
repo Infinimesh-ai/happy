@@ -80,20 +80,37 @@ export type FetchLike = (url: string, init?: {
   method?: string;
   headers?: Record<string, string>;
   body?: string;
-}) => Promise<{ ok: boolean; status: number; json(): Promise<unknown>; text(): Promise<string> }>;
+}) => Promise<{
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+  text(): Promise<string>;
+  /** Optional (global fetch provides it) — used to surface Retry-After. */
+  headers?: { get(name: string): string | null };
+}>;
 
 export function accessProofChallenge(provider: CryptoProvider, method: string, path: string, accessToken: string): string {
   const tokenHash = toBase64Url(provider.sha256(utf8Encode(accessToken)));
   return ['iscp/v2/relay/access-proof', method.toUpperCase(), path, tokenHash].join('\0');
 }
 
-async function parseError(response: { status: number; json(): Promise<unknown>; text(): Promise<string> }, context: string): Promise<never> {
+async function parseError(
+  response: { status: number; json(): Promise<unknown>; text(): Promise<string>; headers?: { get(name: string): string | null } },
+  context: string,
+): Promise<never> {
   let wire: unknown;
   try {
     wire = await response.json();
   } catch {
     wire = undefined;
   }
+  // Retry-After (seconds form) accompanies the Cloud's 429 gates
+  // (renewal_not_yet_eligible / rate_limited); surface it so schedulers can
+  // honor the server-provided pacing instead of guessing.
+  const retryAfterRaw = response.headers?.get('retry-after') ?? null;
+  const retryAfterSeconds = retryAfterRaw !== null && /^\d+$/.test(retryAfterRaw.trim())
+    ? Number(retryAfterRaw.trim())
+    : undefined;
   // Infinimesh Cloud error envelope: { error: { code, message, reason, request_id } }.
   // Surface the stable machine reason (ticket_consumed, device_proof_invalid, ...)
   // so callers can react without string-matching human messages.
@@ -101,7 +118,14 @@ async function parseError(response: { status: number; json(): Promise<unknown>; 
     const err = (wire as { error: Record<string, unknown> }).error;
     if (typeof err.message === 'string' && typeof err.reason === 'string') {
       throw iscpError(IscpErrorCodes.AccessInvalid, `${context} failed with status ${response.status}: ${err.message} (${err.reason})`, {
-        details: { reason: err.reason, ...(typeof err.code === 'string' ? { code: err.code } : {}) },
+        // details is a wire-shaped string map (iscp.error.v2): numeric
+        // metadata is therefore string-encoded.
+        details: {
+          reason: err.reason,
+          httpStatus: String(response.status),
+          ...(retryAfterSeconds !== undefined ? { retryAfterSeconds: String(retryAfterSeconds) } : {}),
+          ...(typeof err.code === 'string' ? { code: err.code } : {}),
+        },
       });
     }
   }
@@ -258,6 +282,53 @@ export class RelayHttpClient {
     const raw = (await response.json()) as { grant?: unknown };
     if (raw === null || typeof raw !== 'object' || raw.grant === undefined) {
       throw iscpError(IscpErrorCodes.TrustInvalid, 'grant renewal did not return a trust grant');
+    }
+    return GrantRenewalSchema.parse(raw);
+  }
+
+  /**
+   * POST /v2/relay/devices/auto-renew-grant — Infinimesh Cloud background
+   * auto-renewal (frozen contract, InfinimeshCloud
+   * docs/10-design/12-managed-provisioning.md §10.4).
+   *
+   * There is no renewal_id: the MANDATORY client-generated, unguessable
+   * `Idempotency-Key` doubles as the possession-proof challenge
+   * (audience = relay id, challenge = the header value). A 201 carries the
+   * device record and the fresh trust grant only — credentials do not rotate
+   * and the device key is untouched.
+   *
+   * Deliberately single-shot (no hidden network retry, unlike renewGrant):
+   * the caller — the happy daemon's renewal scheduler — persists the key
+   * across crashes and owns the whole retry ladder. An unknown-outcome retry
+   * MUST reuse the same key (the Cloud replays the stored response); pass
+   * `proof` to resend the exact original proof verbatim, or omit it to mint
+   * a fresh proof for the same key.
+   */
+  async autoRenewGrant(
+    device: Device,
+    opts: { idempotencyKey: string; proof?: DeviceProof },
+  ): Promise<GrantRenewal> {
+    if (opts.idempotencyKey === '') {
+      throw iscpError(IscpErrorCodes.AccessInvalid, 'grant auto-renewal requires a non-empty idempotency key');
+    }
+    const proof = opts.proof ?? createDeviceProof(this.provider, device, {
+      audience: this.relayId,
+      challenge: opts.idempotencyKey,
+      now: this.now(),
+    });
+    const path = '/v2/relay/devices/auto-renew-grant';
+    const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': opts.idempotencyKey,
+      },
+      body: JSON.stringify({ identity: device.identity, identity_proof: proof }),
+    });
+    if (!response.ok) await parseError(response, 'grant auto-renewal');
+    const raw = (await response.json()) as { grant?: unknown };
+    if (raw === null || typeof raw !== 'object' || raw.grant === undefined) {
+      throw iscpError(IscpErrorCodes.TrustInvalid, 'grant auto-renewal did not return a trust grant');
     }
     return GrantRenewalSchema.parse(raw);
   }

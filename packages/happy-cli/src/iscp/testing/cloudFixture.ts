@@ -55,6 +55,28 @@ export interface RenewalFixtureEntry {
   deviceRevoked?: boolean
 }
 
+/**
+ * Server-side state of the §10.4 background auto-renewal surface
+ * (POST /v2/relay/devices/auto-renew-grant). Configure per test.
+ */
+export interface AutoRenewalFixtureConfig {
+  /** TRUST_AUTO_RENEWAL_MODE kill switch; false → 403 auto_renewal_disabled. */
+  enabled: boolean
+  /** The per-device renewal authorization record. */
+  authorization: 'active' | 'missing' | 'revoked' | 'expired'
+  identityConflict?: boolean
+  deviceRevoked?: boolean
+  audienceInactive?: boolean
+  /** ITES step-up demand → 403 require_mfa. */
+  requireMfa?: boolean
+  /** ITES rate limit → 429 rate_limited (+ Retry-After). */
+  rateLimited?: { retryAfterSeconds: number }
+  /** Eligibility gate → 429 renewal_not_yet_eligible (+ Retry-After). */
+  notYetEligible?: { retryAfterSeconds: number }
+  /** Entitlement upstream fail-closed → 503. */
+  upstreamUnavailable?: boolean
+}
+
 function error(code: string, message: string, reason: string) {
   return { error: { code, message, reason, request_id: 'req_fixture', details: {} } }
 }
@@ -70,8 +92,15 @@ export class CloudFixture {
   grantAudience: string
   lastRegisterBody: Record<string, unknown> | undefined
   lastRenewBody: Record<string, unknown> | undefined
+  lastAutoRenewBody: Record<string, unknown> | undefined
+  lastAutoRenewKey: string | undefined
   registerCalls = 0
   renewCalls = 0
+  autoRenewCalls = 0
+  /** §10.4 background auto-renewal knobs; enabled + active by default. */
+  autoRenewal: AutoRenewalFixtureConfig = { enabled: true, authorization: 'active' }
+  /** TTL of every grant this fixture issues (window-math tests override it). */
+  grantTtlMs = 3600_000
   /** Renewal ids the Cloud knows about; configure per test. */
   readonly renewals = new Map<string, RenewalFixtureEntry>()
   /** Trust directory served by /v2/trust/devices/status; register() fills it. */
@@ -166,7 +195,7 @@ export class CloudFixture {
       permissions: ['text'],
       relay_constraints: [this.ids.relayId],
       not_before: rfc3339Seconds(new Date(now - 60_000)),
-      expires_at: tamper === 'expired' ? rfc3339Seconds(new Date(now - 1_000)) : rfc3339Seconds(new Date(now + 3600_000)),
+      expires_at: tamper === 'expired' ? rfc3339Seconds(new Date(now - 1_000)) : rfc3339Seconds(new Date(now + this.grantTtlMs)),
       revocation_epoch: 0,
     }
     const grant = signObject(provider, TRUST_GRANT_TYPE, unsigned, this.trustSigner.privateKey, this.trustSigner.identity.public_key.kid) as TrustGrant
@@ -188,8 +217,8 @@ export class CloudFixture {
       req.on('data', (chunk: Buffer) => chunks.push(chunk))
       req.on('end', () => {
         const raw = Buffer.concat(chunks).toString('utf8')
-        const { status, body } = this.route(req.method ?? 'GET', req.url ?? '/', raw, req.headers['idempotency-key'] as string | undefined)
-        res.writeHead(status, { 'content-type': 'application/json' })
+        const { status, body, headers } = this.route(req.method ?? 'GET', req.url ?? '/', raw, req.headers['idempotency-key'] as string | undefined)
+        res.writeHead(status, { 'content-type': 'application/json', ...headers })
         res.end(body)
       })
     })
@@ -203,7 +232,7 @@ export class CloudFixture {
     await new Promise<void>((resolve, reject) => this.server.close((err) => (err ? reject(err) : resolve())))
   }
 
-  private route(method: string, url: string, raw: string, idempotencyKey: string | undefined): { status: number; body: string } {
+  private route(method: string, url: string, raw: string, idempotencyKey: string | undefined): { status: number; body: string; headers?: Record<string, string> } {
     if (method === 'GET' && url === '/.well-known/iscp/relay') {
       return { status: 200, body: JSON.stringify({ descriptor: this.signedRelayDescriptor() }) }
     }
@@ -230,6 +259,22 @@ export class CloudFixture {
       }
       const result = url === '/v2/relay/devices/register-with-ticket' ? this.register(raw) : this.renew(raw)
       if (idempotencyKey !== undefined) this.idempotency.set(idempotencyKey, result)
+      return result
+    }
+    if (method === 'POST' && url === '/v2/relay/devices/auto-renew-grant') {
+      // §10.4: the Idempotency-Key is MANDATORY (it doubles as the proof
+      // challenge) and the replay check runs BEFORE everything else — a
+      // completed logical renewal replays even with a stale/burned proof.
+      // Only COMPLETED renewals are stored (idempotency.CompleteWith happens
+      // in step 8's transaction): early rejections re-execute on retry, so
+      // the fresh-proof-same-key escalation of the client ladder can land.
+      if (idempotencyKey === undefined || idempotencyKey === '') {
+        return { status: 400, body: JSON.stringify(error('invalid_request', 'Idempotency-Key header is required', 'idempotency_key_required')) }
+      }
+      const replay = this.idempotency.get(idempotencyKey)
+      if (replay !== undefined) return replay
+      const result = this.autoRenew(raw, idempotencyKey)
+      if (result.status === 201) this.idempotency.set(idempotencyKey, result)
       return result
     }
     return { status: 404, body: JSON.stringify(error('not_found', 'no route', 'no_route')) }
@@ -391,6 +436,90 @@ export class CloudFixture {
       return { status: 409, body: JSON.stringify(error('conflict', 'conflicting identity registered for this device', 'renewal_identity_conflict')) }
     }
     entry.state = 'consumed'
+    return {
+      status: 201,
+      body: JSON.stringify({
+        data: { device_id: body.identity.device_id, domain_id: body.identity.domain_id },
+        grant: this.issueGrant(body.identity.device_id, body.identity.public_key.kid),
+      }),
+    }
+  }
+
+  /** Pre-burn a proof nonce (simulates a server that inserted the nonce but crashed before completing). */
+  burnNonce(nonce: string): void {
+    this.nonces.add(nonce)
+  }
+
+  /** §10.4 background auto-renewal (server order per the frozen contract). */
+  private autoRenew(raw: string, idempotencyKey: string): { status: number; body: string; headers?: Record<string, string> } {
+    this.autoRenewCalls += 1
+    this.lastAutoRenewKey = idempotencyKey
+    const body = JSON.parse(raw) as {
+      identity?: DeviceIdentity
+      identity_proof?: DeviceProof
+    }
+    this.lastAutoRenewBody = body as Record<string, unknown>
+    if (!body.identity || !body.identity_proof) {
+      return { status: 400, body: JSON.stringify(error('invalid_request', 'identity and identity_proof are required', 'missing_identity_proof')) }
+    }
+    const cfg = this.autoRenewal
+    // 1. Feature flag / rollout gate.
+    if (!cfg.enabled) {
+      return { status: 403, body: JSON.stringify(error('forbidden', 'background auto-renewal is disabled', 'auto_renewal_disabled')) }
+    }
+    // 2. Proof verification: challenge = the Idempotency-Key header value.
+    try {
+      verifyDeviceProof(provider, body.identity, body.identity_proof, { audience: this.ids.relayId, challenge: idempotencyKey })
+    } catch {
+      return { status: 401, body: JSON.stringify(error('unauthorized', 'identity possession proof invalid', 'device_proof_invalid')) }
+    }
+    if (this.nonces.has(body.identity_proof.nonce)) {
+      return { status: 409, body: JSON.stringify(error('conflict', 'device proof replay', 'proof_replay_detected')) }
+    }
+    this.nonces.add(body.identity_proof.nonce)
+    // 3. Authorization lookup by device identity (never an id from the client).
+    if (cfg.authorization === 'missing') {
+      return { status: 404, body: JSON.stringify(error('not_found', 'no renewal authorization for this device', 'renewal_authorization_not_found')) }
+    }
+    if (cfg.authorization === 'revoked') {
+      return { status: 403, body: JSON.stringify(error('forbidden', 'renewal authorization revoked', 'renewal_authorization_revoked')) }
+    }
+    if (cfg.authorization === 'expired') {
+      return { status: 410, body: JSON.stringify(error('gone', 'renewal authorization expired', 'renewal_authorization_expired')) }
+    }
+    // 4./5. Boundary gates: thumbprint, device, audience — all fail-closed.
+    if (cfg.identityConflict === true) {
+      return { status: 409, body: JSON.stringify(error('conflict', 'conflicting identity registered for this device', 'renewal_identity_conflict')) }
+    }
+    if (cfg.deviceRevoked === true) {
+      return { status: 403, body: JSON.stringify(error('forbidden', 'device revoked', 'device_revoked')) }
+    }
+    if (cfg.audienceInactive === true) {
+      return { status: 403, body: JSON.stringify(error('forbidden', 'grant audience is not active', 'grant_audience_not_active')) }
+    }
+    // 6. Eligibility window gate.
+    if (cfg.notYetEligible !== undefined) {
+      return {
+        status: 429,
+        body: JSON.stringify(error('too_many_requests', 'renewal window not yet open', 'renewal_not_yet_eligible')),
+        headers: { 'retry-after': String(cfg.notYetEligible.retryAfterSeconds) },
+      }
+    }
+    // 7. ITES fresh evaluation outcomes.
+    if (cfg.requireMfa === true) {
+      return { status: 403, body: JSON.stringify(error('forbidden', 'step-up authentication required', 'require_mfa')) }
+    }
+    if (cfg.rateLimited !== undefined) {
+      return {
+        status: 429,
+        body: JSON.stringify(error('too_many_requests', 'rate limited', 'rate_limited')),
+        headers: { 'retry-after': String(cfg.rateLimited.retryAfterSeconds) },
+      }
+    }
+    if (cfg.upstreamUnavailable === true) {
+      return { status: 503, body: JSON.stringify(error('unavailable', 'entitlement upstream unavailable', 'upstream_unavailable')) }
+    }
+    // 8. Issue: grant only — no credentials, no new device row, key untouched.
     return {
       status: 201,
       body: JSON.stringify({

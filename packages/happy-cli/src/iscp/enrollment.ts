@@ -656,6 +656,78 @@ const RENEWAL_REASON_HINTS: Record<string, string> = {
 }
 
 /**
+ * Resolve the trust descriptor used to verify a (re)issued grant: prefer a
+ * freshly fetched signed descriptor (the grant may be signed by a rotated
+ * key), fall back to the enrolled descriptor when the trust root is
+ * unreachable. Shared by manual renewal and the daemon auto-renewal
+ * scheduler.
+ */
+export async function resolveTrustDescriptorForVerification(
+  provider: CryptoProvider,
+  bundle: IscpProfileBundle,
+  opts?: { trustUrl?: string; trustRootId?: string; log?: (line: string) => void },
+): Promise<TrustRootDescriptor> {
+  const enrolledTrust = verifyTrustRootDescriptor(provider, bundle.trust_root_descriptor, { now: new Date(bundle.enrolled_at) })
+  try {
+    const trustClient = new TrustRootClient({
+      baseUrl: opts?.trustUrl ?? enrolledTrust.base_url,
+      trustRootId: opts?.trustRootId ?? bundle.trust_root_id,
+      provider,
+    })
+    return verifyTrustRootDescriptor(provider, await trustClient.fetchSignedDescriptor())
+  } catch {
+    opts?.log?.('Trust root unreachable for a fresh descriptor; verifying against the enrolled descriptor.')
+    return enrolledTrust
+  }
+}
+
+/**
+ * Shared renewal apply step (manual `happy iscp renew` AND daemon
+ * auto-renewal): verify the 201 response against the local profile and
+ * atomically replace ONLY `trust_grant` (+ generation+1). The device key and
+ * identity never change; any failure leaves the old bundle byte-for-byte
+ * intact. Caller must hold the profile lock.
+ *
+ * Verification before anything touches disk:
+ * - the returned device record matches the enrolled identity;
+ * - the grant is signed by an active trust root key;
+ * - subject = our device id, confirmation = our key thumbprint;
+ * - audience MUST equal the enrolled grant's audience (drift rejected);
+ * - constrained to the enrolled relay and inside its validity window.
+ */
+export function verifyAndApplyRenewedGrant(
+  provider: CryptoProvider,
+  opts: {
+    profileId: string
+    bundle: IscpProfileBundle
+    device: Device
+    relayId: string
+    trustDescriptor: TrustRootDescriptor
+    renewal: { data: { device_id: string; domain_id: string }; grant: TrustGrant }
+  },
+): IscpProfileBundle {
+  const { bundle, device, renewal } = opts
+  if (renewal.data.device_id !== device.identity.device_id || renewal.data.domain_id !== device.identity.domain_id) {
+    throw new Error('grant renewal returned a different device identity; refusing to touch the local profile')
+  }
+  const grant = renewal.grant
+  verifyGrant(provider, grant, grantSigningKey(opts.trustDescriptor, grant.signature.kid), {
+    audience: bundle.trust_grant.audience,
+    subjectDeviceId: device.identity.device_id,
+    confirmationThumbprint: device.identity.public_key.kid,
+    permission: grant.permissions[0] ?? 'text',
+    relayId: opts.relayId,
+  })
+  const updated: IscpProfileBundle = {
+    ...bundle,
+    trust_grant: grant,
+    generation: (bundle.generation ?? 1) + 1,
+  }
+  writeBundleAtomic(opts.profileId, updated)
+  return updated
+}
+
+/**
  * Renew the trust grant of a healthy profile in place. The device key and
  * identity NEVER change here — only `trust_grant` (and the generation
  * counter) are updated, atomically. Any failure leaves the old bundle
@@ -678,17 +750,7 @@ export async function renewProfileGrant(opts: RenewOptions): Promise<{ profileId
     const enrolledRelay = verifyRelayDescriptor(provider, bundle.relay_descriptor, { now: new Date(bundle.enrolled_at) })
     const relayHttp = new RelayHttpClient({ baseUrl: opts.relayUrl ?? enrolledRelay.base_url, relayId, provider })
 
-    // Prefer a fresh trust descriptor (the grant may be signed by a rotated
-    // key); fall back to the enrolled descriptor when the trust root is
-    // unreachable.
-    const enrolledTrust = verifyTrustRootDescriptor(provider, bundle.trust_root_descriptor, { now: new Date(bundle.enrolled_at) })
-    let trustDescriptor: TrustRootDescriptor = enrolledTrust
-    try {
-      const trustClient = new TrustRootClient({ baseUrl: opts.trustUrl ?? enrolledTrust.base_url, trustRootId, provider })
-      trustDescriptor = verifyTrustRootDescriptor(provider, await trustClient.fetchSignedDescriptor())
-    } catch {
-      log('Trust root unreachable for a fresh descriptor; verifying against the enrolled descriptor.')
-    }
+    const trustDescriptor = await resolveTrustDescriptorForVerification(provider, bundle, { trustUrl: opts.trustUrl, trustRootId, log })
 
     log(`Renewing grant for device ${device.identity.device_id} (profile ${opts.profileId})`)
     let renewal
@@ -703,27 +765,16 @@ export async function renewProfileGrant(opts: RenewOptions): Promise<{ profileId
       }
       throw error
     }
-    if (renewal.data.device_id !== device.identity.device_id || renewal.data.domain_id !== device.identity.domain_id) {
-      throw new Error('grant renewal returned a different device identity; refusing to touch the local profile')
-    }
 
-    // Verify the new grant before it touches disk. The audience MUST equal
-    // the enrolled grant's audience — an audience drift is rejected outright.
-    const grant = renewal.grant
-    verifyGrant(provider, grant, grantSigningKey(trustDescriptor, grant.signature.kid), {
-      audience: bundle.trust_grant.audience,
-      subjectDeviceId: device.identity.device_id,
-      confirmationThumbprint: device.identity.public_key.kid,
-      permission: grant.permissions[0] ?? 'text',
+    const updated = verifyAndApplyRenewedGrant(provider, {
+      profileId: opts.profileId,
+      bundle,
+      device,
       relayId,
+      trustDescriptor,
+      renewal,
     })
-
-    const updated: IscpProfileBundle = {
-      ...bundle,
-      trust_grant: grant,
-      generation: (bundle.generation ?? 1) + 1,
-    }
-    writeBundleAtomic(opts.profileId, updated)
+    const grant = updated.trust_grant
     log('')
     log(`Grant renewed for profile "${opts.profileId}".`)
     log(`  grant:      ${grant.grant_id} (permissions: ${grant.permissions.join(', ')})`)

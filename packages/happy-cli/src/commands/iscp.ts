@@ -25,6 +25,7 @@ import {
   readProfileBundle,
   renewProfileGrant,
 } from '@/iscp/enrollment'
+import { autoRenewalStatusView, readAutoRenewalState } from '@/iscp/autoRenewal'
 import type { ProfilePeerStatus } from '@/iscp/sessionInitiator'
 
 const CLOUD_DEFAULTS = {
@@ -111,6 +112,11 @@ ${chalk.bold('Notes:')}
   - Managed enrollment verifies the signed ticket and the returned Trust
     Grant before anything is written to disk. Ticket payloads are never
     printed; neither are tokens or keys.
+  - With background auto-renewal enabled (from JingSi/Console), the happy
+    daemon renews the trust grant automatically inside the renewal window
+    (min(24h, grantTTL/5)). "happy iscp status" shows that layer separately
+    from grant validity and from relay credential health; "happy iscp renew"
+    stays available as the manual/diagnostic fallback.
   - The local-lab defaults match the reference harness:
       docker compose -f environments/iscp/docker-compose.yaml up --build -d
 `)
@@ -260,9 +266,61 @@ async function handleStatus(args: string[]): Promise<void> {
     console.log(`  access expires:     ${bundle.access_credential.expires_at}`)
     console.log(`  refresh expires:    ${bundle.refresh_credential.expires_at}`)
     console.log(`  enrolled at:        ${bundle.enrolled_at}`)
+    // Two DISTINCT lifecycle layers (OPS §8.3): the short-lived grant
+    // validity above, and the background auto-renewal machinery below. Relay
+    // access/refresh credential issues are a third, independent lifecycle —
+    // never collapse these into one message.
+    printAutoRenewalStatus(profileId, bundle)
     if (check) {
       await printCheckLayers(provider, profileId, bundle, peerStatuses)
     }
+  }
+}
+
+const AUTO_RENEWAL_ACTION_HINTS: Record<string, string> = {
+  renewal_authorization_not_found: 'auto-renewal is not enabled for this device — enable it from JingSi/Console',
+  renewal_authorization_revoked: 'auto-renewal was switched off — re-enable it from JingSi/Console if desired',
+  renewal_authorization_expired: 'the auto-renewal authorization reached its absolute expiry — re-authorize from JingSi/Console',
+  renewal_identity_conflict: 'the Cloud holds a DIFFERENT key for this device (replace-required); this needs an explicit decision, never an automatic re-enrollment',
+  device_revoked: 'this device has been revoked by the Cloud',
+  grant_audience_not_active: 'the paired phone is no longer active/trusted — re-pair from JingSi/Console',
+  require_mfa: 'the Cloud demands a step-up — re-authorize from JingSi/Console',
+  auto_renewal_disabled: 'background auto-renewal is disabled server-side (kill switch); manual renewal still works',
+  proof_replay_anomaly: 'contract anomaly during an idempotent retry — collect daemon logs and renew manually',
+}
+
+/**
+ * The background auto-renewal layer, read from the scheduler's on-disk state
+ * (works with the daemon down). Deliberately printed as its own block so
+ * grant validity, auto-renewal health, and relay credential health never
+ * fold into one message.
+ */
+function printAutoRenewalStatus(profileId: string, bundle: NonNullable<ReturnType<typeof readProfileBundle>>): void {
+  const view = autoRenewalStatusView(bundle, readAutoRenewalState(profileId), Date.now())
+  const display = view.display
+  switch (display.kind) {
+    case 'action-required': {
+      const hint = AUTO_RENEWAL_ACTION_HINTS[display.reason]
+      console.log(`  auto-renewal:       ${chalk.red(`ACTION REQUIRED — ${display.reason}`)} (since ${display.at})`)
+      if (hint !== undefined) console.log(`                      ${hint}`)
+      console.log(`                      manual fallback: happy iscp renew <renewal-id>`)
+      break
+    }
+    case 'retrying-unknown-outcome':
+      console.log(`  auto-renewal:       ${chalk.yellow('retrying an unresolved attempt')} (started ${display.startedAt}${display.nextAttemptAt !== undefined ? `, next retry ${display.nextAttemptAt}` : ''}; same idempotency key)`)
+      break
+    case 'scheduled':
+      console.log(`  auto-renewal:       ${chalk.green('scheduled')} — next attempt ${display.nextAttemptAt}`)
+      break
+    case 'waiting':
+      console.log(`  auto-renewal:       waiting — renewal window opens ${display.windowOpensAt}`)
+      break
+  }
+  if (view.lastSuccessAt !== undefined) {
+    console.log(`                      last renewed: ${view.lastSuccessAt}`)
+  }
+  if (view.lastResult !== undefined && view.lastResult !== 'renewed') {
+    console.log(`                      last attempt result: ${view.lastResult}${view.lastAttemptAt !== undefined ? ` (at ${view.lastAttemptAt})` : ''}`)
   }
 }
 

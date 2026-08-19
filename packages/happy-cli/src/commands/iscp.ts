@@ -26,6 +26,7 @@ import {
   renewProfileGrant,
 } from '@/iscp/enrollment'
 import { autoRenewalStatusView, readAutoRenewalState } from '@/iscp/autoRenewal'
+import { readCredentialRecoveryState, recoverProfileCredentialsNow, refreshCredentialTerminal } from '@/iscp/credentialRecovery'
 import type { ProfilePeerStatus } from '@/iscp/sessionInitiator'
 
 const CLOUD_DEFAULTS = {
@@ -42,6 +43,7 @@ ${chalk.bold('happy iscp')} - ISCP device enrollment (dual-stack)
 ${chalk.bold('Usage:')}
   happy iscp enroll <ticket-or-wrapper> [options]   Enroll this machine as an ISCP device
   happy iscp renew <renewal-id> [options]           Renew the trust grant (device key unchanged)
+  happy iscp recover [options]                      Recover relay credentials (device key + valid grant)
   happy iscp status [profile] [--check]             Show enrolled ISCP profiles
   happy iscp help                                   Show this help
 
@@ -92,6 +94,17 @@ ${chalk.bold('Options (renew):')}
                         enrolled trust root descriptor)
   --relay-id <id>       Override the relay id    (default: enrolled relay id)
   --trust-root-id <id>  Override the trust root id (default: enrolled id)
+
+${chalk.bold('Options (recover):')}
+  --profile <id>        Profile to recover       (default cloud-prod, or
+                        ISCP_CLOUD_PROFILE)
+  --relay-url <url>     Override the relay base URL (default: from the
+                        enrolled relay descriptor)
+  --force               Clear a persisted action-required stop and retry.
+                        Recovery requires the enrolled device key AND a
+                        currently valid trust grant; an expired grant needs
+                        "happy iscp renew" FIRST (the order never flips), and
+                        recovery never re-enrolls or replaces the identity.
 
 ${chalk.bold('Options (status):')}
   --check               Six-layer live check: ① local profile integrity
@@ -215,7 +228,7 @@ async function handleRenew(args: string[]): Promise<void> {
   }
   const profileId = profileOption ?? CLOUD_DEFAULTS.profile()
 
-  const { profileId: renewedProfile } = await renewProfileGrant({
+  const { profileId: renewedProfile, bundle } = await renewProfileGrant({
     profileId,
     renewalId,
     relayUrl,
@@ -226,6 +239,67 @@ async function handleRenew(args: string[]): Promise<void> {
   })
   console.log('')
   console.log(chalk.green(`✓ Trust grant renewed for profile "${renewedProfile}"`))
+  // A grant renewed after a long offline gap often outlives its refresh
+  // credential (independent lifecycle, InfinimeshCloud §11): recover the
+  // relay credentials with the fresh grant so the machine actually comes
+  // back online — a valid grant over a dead bearer was the 2026-08-19
+  // production incident. Best-effort: failure keeps the renewal.
+  if (refreshCredentialTerminal(bundle, Date.now())) {
+    console.log('')
+    console.log('Refresh credential is terminal; recovering relay credentials with the renewed grant...')
+    try {
+      const outcome = await recoverProfileCredentialsNow({
+        profileId: renewedProfile,
+        relayUrlOverride: relayUrl,
+        log: (line) => console.log(line),
+      })
+      if (outcome.result === 'recovered') {
+        console.log(chalk.green(`✓ Relay credentials recovered for profile "${renewedProfile}"`))
+      } else {
+        console.log(chalk.yellow(`! Relay credential recovery did not complete (${outcome.result}${'reason' in outcome ? `: ${outcome.reason}` : ''}); run: happy iscp recover --profile ${renewedProfile}`))
+      }
+    } catch (error) {
+      console.log(chalk.yellow(`! Relay credential recovery failed (${error instanceof Error ? error.message : String(error)}); run: happy iscp recover --profile ${renewedProfile}`))
+    }
+  }
+}
+
+async function handleRecover(args: string[]): Promise<void> {
+  const relayUrl = takeOption(args, '--relay-url')
+  const profileOption = takeOption(args, '--profile')
+  const force = takeFlag(args, '--force')
+  const unknown = args.find((a) => a.startsWith('--'))
+  if (unknown !== undefined) {
+    throw new Error(`unknown option ${unknown} (see: happy iscp help)`)
+  }
+  const profileId = profileOption ?? CLOUD_DEFAULTS.profile()
+  const outcome = await recoverProfileCredentialsNow({
+    profileId,
+    relayUrlOverride: relayUrl,
+    force,
+    log: (line) => console.log(line),
+  })
+  console.log('')
+  switch (outcome.result) {
+    case 'recovered':
+      console.log(chalk.green(`✓ Relay credentials recovered for profile "${profileId}"`))
+      return
+    case 'action-required': {
+      const hint = CREDENTIAL_RECOVERY_ACTION_HINTS[outcome.reason]
+      console.log(chalk.red(`✗ Credential recovery stopped: ${outcome.reason}`))
+      if (hint !== undefined) console.log(`  ${hint}`)
+      process.exitCode = 1
+      return
+    }
+    case 'transient':
+      console.log(chalk.yellow(`! Credential recovery attempt failed (${outcome.reason}); retry in a moment`))
+      process.exitCode = 1
+      return
+    case 'unknown-kept':
+      console.log(chalk.yellow(`! Credential recovery outcome unknown (${outcome.reason}); re-run to retry the same idempotency key`))
+      process.exitCode = 1
+      return
+  }
 }
 
 async function handleStatus(args: string[]): Promise<void> {
@@ -263,17 +337,73 @@ async function handleStatus(args: string[]): Promise<void> {
     if (grant.relay_constraints !== undefined && grant.relay_constraints.length > 0) {
       console.log(`  relay constraints:  ${grant.relay_constraints.join(', ')}`)
     }
-    console.log(`  access expires:     ${bundle.access_credential.expires_at}`)
-    console.log(`  refresh expires:    ${bundle.refresh_credential.expires_at}`)
+    printCredentialLines(bundle)
     console.log(`  enrolled at:        ${bundle.enrolled_at}`)
-    // Two DISTINCT lifecycle layers (OPS §8.3): the short-lived grant
-    // validity above, and the background auto-renewal machinery below. Relay
-    // access/refresh credential issues are a third, independent lifecycle —
-    // never collapse these into one message.
+    // Three DISTINCT lifecycle layers (OPS §8.3 + 2026-08-18 §8.2.4): the
+    // short-lived grant validity above, the background auto-renewal
+    // machinery, and the relay access/refresh credential health — never
+    // collapse these into one message.
     printAutoRenewalStatus(profileId, bundle)
+    printCredentialRecoveryStatus(profileId, bundle)
     if (check) {
       await printCheckLayers(provider, profileId, bundle, peerStatuses)
     }
+  }
+}
+
+/**
+ * Relay credential lines. These are LOCAL metadata — the last facts the
+ * server told us at issuance/rotation/recovery; a pre-metadata bundle only
+ * knows the enrollment-time snapshot and says so, instead of presenting a
+ * stale timestamp as the current server truth (OPS 2026-08-18 §8.1).
+ */
+function printCredentialLines(bundle: NonNullable<ReturnType<typeof readProfileBundle>>): void {
+  const access = bundle.access_credential
+  const refresh = bundle.refresh_credential
+  const freshness = access.issued_at !== undefined || refresh.issued_at !== undefined
+    ? ''
+    : chalk.dim(' (enrollment-time snapshot; the server may have rotated since)')
+  console.log(`  access expires:     ${access.expires_at}${access.issued_at !== undefined ? ` (issued ${access.issued_at})` : ''}${freshness}`)
+  console.log(`  refresh expires:    ${refresh.expires_at}${refresh.issued_at !== undefined ? ` (issued ${refresh.issued_at})` : ''}${refresh.rotation_counter !== undefined ? ` rotation ${refresh.rotation_counter}` : ''}`)
+  if (refreshCredentialTerminal(bundle, Date.now())) {
+    console.log(`                      ${chalk.yellow('refresh credential is past its expiry — the daemon recovers it automatically; manual: happy iscp recover')}`)
+  }
+}
+
+const CREDENTIAL_RECOVERY_ACTION_HINTS: Record<string, string> = {
+  credential_recovery_disabled: 'credential recovery is disabled server-side (kill switch); wait for the rollout or contact ops',
+  device_revoked: 'this device has been revoked by the Cloud',
+  recovery_identity_conflict: 'the Cloud holds a DIFFERENT key for this device (replace-required); this needs an explicit decision, never an automatic re-enrollment',
+  recovery_grant_missing: 'this device has no trust grant — recovery needs a valid grant first',
+  recovery_grant_revoked: 'the trust grant is revoked — re-authorize from JingSi/Console first',
+  recovery_grant_expired: 'the trust grant is expired — renew it first (happy iscp renew / auto-renewal), then recovery re-runs automatically',
+  proof_replay_anomaly: 'contract anomaly during an idempotent retry — collect daemon logs',
+  recovery_response_invalid: 'the recovery response failed local verification — collect daemon logs; retry with --force after the cause is understood',
+}
+
+/**
+ * The credential-recovery layer, read from its on-disk state (works with the
+ * daemon down). Only printed when there is something to show — a healthy
+ * credential chain needs no extra line.
+ */
+function printCredentialRecoveryStatus(profileId: string, bundle: NonNullable<ReturnType<typeof readProfileBundle>>): void {
+  const state = readCredentialRecoveryState(profileId)
+  if (state === null) return
+  if (state.action_required !== undefined && state.action_required.grant_id === bundle.trust_grant.grant_id) {
+    const hint = CREDENTIAL_RECOVERY_ACTION_HINTS[state.action_required.reason]
+    console.log(`  credential recovery: ${chalk.red(`ACTION REQUIRED — ${state.action_required.reason}`)} (since ${state.action_required.at})`)
+    if (hint !== undefined) console.log(`                      ${hint}`)
+    return
+  }
+  if (state.inflight !== undefined) {
+    console.log(`  credential recovery: ${chalk.yellow('retrying an unresolved attempt')} (started ${state.inflight.started_at}; same idempotency key)`)
+    return
+  }
+  if (state.last_success_at !== undefined) {
+    console.log(`  credential recovery: last recovered ${state.last_success_at}`)
+  }
+  if (state.last_result !== undefined && state.last_result !== 'recovered') {
+    console.log(`                      last attempt result: ${state.last_result}${state.last_attempt_at !== undefined ? ` (at ${state.last_attempt_at})` : ''}`)
   }
 }
 
@@ -442,6 +572,9 @@ export async function handleIscpCommand(args: string[]): Promise<void> {
       return
     case 'renew':
       await handleRenew(args.slice(1))
+      return
+    case 'recover':
+      await handleRecover(args.slice(1))
       return
     case 'status':
       await handleStatus(args.slice(1))

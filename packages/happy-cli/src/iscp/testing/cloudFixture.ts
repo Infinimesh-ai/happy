@@ -18,11 +18,17 @@
 import { createServer, type Server } from 'node:http'
 
 import {
+  CREDENTIAL_RECOVERY_WRAPPED_TYPE,
+  X25519PublicKey,
   createDevice,
   createNobleProvider,
+  fromBase64Url,
+  recoveryChallenge,
   rfc3339Seconds,
   signObject,
   signPairingTicket,
+  toBase64Url,
+  utf8Encode,
   verifyDeviceProof,
   verifyPairingTicket,
   SIGNED_DESCRIPTOR_TYPE,
@@ -81,6 +87,20 @@ function error(code: string, message: string, reason: string) {
   return { error: { code, message, reason, request_id: 'req_fixture', details: {} } }
 }
 
+/**
+ * Server-side state of the §11 existing-device credential recovery surface
+ * (POST /v2/relay/devices/recover-credentials). Configure per test.
+ */
+export interface CredentialRecoveryFixtureConfig {
+  /** RELAY_CREDENTIAL_RECOVERY_MODE kill switch; false → 403 credential_recovery_disabled. */
+  enabled: boolean
+  /** The latest trust grant's recovery gate state. */
+  grant: 'active' | 'missing' | 'revoked' | 'expired'
+  identityConflict?: boolean
+  deviceRevoked?: boolean
+  upstreamUnavailable?: boolean
+}
+
 /** Minimal but faithful double of the Cloud's v2 signed-ticket + renewal endpoints. */
 export class CloudFixture {
   readonly relaySigner: Device
@@ -99,6 +119,12 @@ export class CloudFixture {
   autoRenewCalls = 0
   /** §10.4 background auto-renewal knobs; enabled + active by default. */
   autoRenewal: AutoRenewalFixtureConfig = { enabled: true, authorization: 'active' }
+  /** §11 credential recovery knobs; enabled + active grant by default. */
+  credentialRecovery: CredentialRecoveryFixtureConfig = { enabled: true, grant: 'active' }
+  recoverCalls = 0
+  lastRecoverKey: string | undefined
+  lastRecoverBody: Record<string, unknown> | undefined
+  private recoveredRotation = 2
   /** TTL of every grant this fixture issues (window-math tests override it). */
   grantTtlMs = 3600_000
   /** Renewal ids the Cloud knows about; configure per test. */
@@ -259,6 +285,20 @@ export class CloudFixture {
       }
       const result = url === '/v2/relay/devices/register-with-ticket' ? this.register(raw) : this.renew(raw)
       if (idempotencyKey !== undefined) this.idempotency.set(idempotencyKey, result)
+      return result
+    }
+    if (method === 'POST' && url === '/v2/relay/devices/recover-credentials') {
+      // §11.1: the Idempotency-Key is MANDATORY (it is half of the proof
+      // challenge) and only COMPLETED recoveries are stored — the stored
+      // response carries the tokens as ciphertext only, so replay is safe
+      // by construction.
+      if (idempotencyKey === undefined || idempotencyKey === '') {
+        return { status: 400, body: JSON.stringify(error('invalid_request', 'Idempotency-Key header is required', 'idempotency_key_required')) }
+      }
+      const replay = this.idempotency.get(idempotencyKey)
+      if (replay !== undefined) return replay
+      const result = this.recover(raw, idempotencyKey)
+      if (result.status === 201) this.idempotency.set(idempotencyKey, result)
       return result
     }
     if (method === 'POST' && url === '/v2/relay/devices/auto-renew-grant') {
@@ -448,6 +488,122 @@ export class CloudFixture {
   /** Pre-burn a proof nonce (simulates a server that inserted the nonce but crashed before completing). */
   burnNonce(nonce: string): void {
     this.nonces.add(nonce)
+  }
+
+  /**
+   * §11 existing-device credential recovery (server order per the frozen
+   * contract: flag → proof → nonce → identity/device gates → grant gate →
+   * atomic rotation → sealed response).
+   */
+  private recover(raw: string, idempotencyKey: string): { status: number; body: string } {
+    this.recoverCalls += 1
+    this.lastRecoverKey = idempotencyKey
+    const body = JSON.parse(raw) as {
+      identity?: DeviceIdentity
+      identity_proof?: DeviceProof
+      recovery_wrap_key?: { kty?: string; public?: string }
+    }
+    this.lastRecoverBody = body as Record<string, unknown>
+    if (!body.identity || !body.identity_proof) {
+      return { status: 400, body: JSON.stringify(error('invalid_request', 'identity and identity_proof are required', 'missing_identity_proof')) }
+    }
+    let clientWrap: X25519PublicKey
+    try {
+      if (body.recovery_wrap_key?.kty !== 'X25519' || typeof body.recovery_wrap_key.public !== 'string') throw new Error('bad wrap key')
+      clientWrap = new X25519PublicKey(fromBase64Url(body.recovery_wrap_key.public))
+    } catch {
+      return { status: 400, body: JSON.stringify(error('invalid_request', 'recovery_wrap_key must be an X25519 public key', 'invalid_recovery_wrap_key')) }
+    }
+    const cfg = this.credentialRecovery
+    // 1. Feature flag / rollout gate.
+    if (!cfg.enabled) {
+      return { status: 403, body: JSON.stringify(error('forbidden', 'relay credential recovery is disabled', 'credential_recovery_disabled')) }
+    }
+    // 2. Proof: challenge = Idempotency-Key \0 wrap key (the real Cloud
+    //    verifies against the STORED key; this double keeps the submitted-key
+    //    check — the stored-key semantics are pinned Cloud-side).
+    try {
+      verifyDeviceProof(provider, body.identity, body.identity_proof, {
+        audience: this.ids.relayId,
+        challenge: recoveryChallenge(idempotencyKey, body.recovery_wrap_key!.public!),
+      })
+    } catch {
+      return { status: 401, body: JSON.stringify(error('unauthorized', 'identity possession proof invalid', 'device_proof_invalid')) }
+    }
+    if (this.nonces.has(body.identity_proof.nonce)) {
+      return { status: 409, body: JSON.stringify(error('conflict', 'device proof replay', 'proof_replay_detected')) }
+    }
+    this.nonces.add(body.identity_proof.nonce)
+    // 3./4. Device gates.
+    if (cfg.identityConflict === true) {
+      return { status: 409, body: JSON.stringify(error('conflict', 'device key does not match the enrolled identity; explicit replace is required', 'recovery_identity_conflict')) }
+    }
+    if (cfg.deviceRevoked === true) {
+      return { status: 403, body: JSON.stringify(error('forbidden', 'device is revoked or suspended', 'device_revoked')) }
+    }
+    // 5. Grant gate: recovery's authority anchor is a currently valid grant.
+    if (cfg.grant === 'missing') {
+      return { status: 403, body: JSON.stringify(error('forbidden', 'device has no trust grant', 'recovery_grant_missing')) }
+    }
+    if (cfg.grant === 'revoked') {
+      return { status: 403, body: JSON.stringify(error('forbidden', 'latest trust grant is revoked', 'recovery_grant_revoked')) }
+    }
+    if (cfg.grant === 'expired') {
+      return { status: 410, body: JSON.stringify(error('not_found', 'latest trust grant is expired; renew the grant before credential recovery', 'recovery_grant_expired')) }
+    }
+    if (cfg.upstreamUnavailable === true) {
+      return { status: 503, body: JSON.stringify(error('unavailable', 'internal error', 'internal_error')) }
+    }
+    // 6. Atomic rotation + sealed response (mirror of the Cloud's §11.4
+    //    sealer: HKDF over transcript ‖ clientPub ‖ serverPub, AAD = transcript).
+    this.recoveredRotation += 1
+    const now = new Date()
+    const pair = {
+      access: {
+        credential_id: `cred_a_${this.recoveredRotation}`,
+        token: `rac_recovered_${this.recoveredRotation}`,
+        domain_id: body.identity.domain_id,
+        device_id: body.identity.device_id,
+        issued_at: now.toISOString(),
+        expires_at: new Date(now.getTime() + 900_000).toISOString(),
+      },
+      refresh: {
+        credential_id: `cred_r_${this.recoveredRotation}`,
+        token: `rrc_recovered_${this.recoveredRotation}`,
+        domain_id: body.identity.domain_id,
+        device_id: body.identity.device_id,
+        issued_at: now.toISOString(),
+        expires_at: new Date(now.getTime() + 86_400_000).toISOString(),
+        rotation_counter: this.recoveredRotation,
+      },
+    }
+    const server = provider.generateSessionKeyPair()
+    const secret = provider.sharedSecret(server.privateKey, clientWrap)
+    const transcript = utf8Encode(`iscp/v2/relay/credential-recovery\0${body.identity.domain_id}\0${body.identity.device_id}\0${body.identity.public_key.kid}`)
+    const info = new Uint8Array(transcript.length + 64)
+    info.set(transcript, 0)
+    info.set(clientWrap.bytes, transcript.length)
+    info.set(server.publicKey.bytes, transcript.length + 32)
+    const key = provider.hkdfSha256(secret, new Uint8Array(0), info, 32)
+    const nonce = provider.randomBytes(12)
+    const ciphertext = provider.seal(key, nonce, utf8Encode(JSON.stringify(pair)), transcript)
+    const strip = ({ token: _token, ...rest }: { token: string } & Record<string, unknown>) => rest
+    return {
+      status: 201,
+      body: JSON.stringify({
+        data: { device_id: body.identity.device_id, domain_id: body.identity.domain_id },
+        access: strip(pair.access),
+        refresh: strip(pair.refresh),
+        credentials_wrapped: {
+          type: CREDENTIAL_RECOVERY_WRAPPED_TYPE,
+          ciphersuite: 'ISCP_V2_X25519_HKDF_SHA256_CHACHA20POLY1305',
+          recovery_public_key: body.recovery_wrap_key!.public,
+          server_public_key: toBase64Url(server.publicKey.bytes),
+          nonce: toBase64Url(nonce),
+          ciphertext: toBase64Url(ciphertext),
+        },
+      }),
+    }
   }
 
   /** §10.4 background auto-renewal (server order per the frozen contract). */

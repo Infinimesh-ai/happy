@@ -374,4 +374,81 @@ describe('IscpPeer over an in-memory relay', () => {
       beta.peer.stop();
     }
   });
+
+  it('passes the full wire credentials (expiry metadata) to onCredentialsRotated', async () => {
+    // OPS 2026-08-18 §8.2.4: persisting only token strings leaves local
+    // expiry metadata stale; the callback must carry the server facts.
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const alpha = createTestPeer(relay, 'device-alpha', identities, issuer);
+    const beta = createTestPeer(relay, 'device-beta', identities, issuer);
+    const credentials = relay.issueCredentials('device-alpha');
+    const rotated: Array<{ access?: { expires_at: string }; refresh?: { expires_at: string } }> = [];
+    const peer = new IscpPeer({
+      device: alpha.device,
+      grant: makeGrant(issuer, alpha.device, relay.relayId),
+      relayDescriptor: relayDescriptor(relay),
+      credentials: { accessToken: 'bogus-token', refreshToken: credentials.refreshToken },
+      resolvePeerIdentity: async (id) => identities.get(id)!,
+      manifest: { device: 'device-alpha' },
+      provider,
+      wsFactory: relay.wsFactory,
+      fetchImpl: relay.fetchImpl,
+      onCredentialsRotated: (c) => rotated.push(c),
+    });
+    beta.peer.start();
+    peer.start();
+    try {
+      await peer.openSession('device-beta', { timeoutMs: 5000 });
+      expect(rotated.length).toBeGreaterThan(0);
+      expect(rotated[0]!.access?.expires_at).toBeTruthy();
+      expect(rotated[0]!.refresh?.expires_at).toBeTruthy();
+    } finally {
+      peer.stop();
+      beta.peer.stop();
+    }
+  });
+
+  it('escalates a terminal refresh failure to the recovery hook instead of failing the send', async () => {
+    // The refresh bearer is dead (expired past its TTL / revoked chain): the
+    // rotation path can never succeed again. With a recovery hook wired
+    // (device-key PoP + valid grant, InfinimeshCloud §11), the peer resumes
+    // with the recovered pair; the hook owns persistence, so the rotation
+    // callback does not re-fire.
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const alpha = createTestPeer(relay, 'device-alpha', identities, issuer);
+    const beta = createTestPeer(relay, 'device-beta', identities, issuer);
+    const recovered = relay.issueCredentials('device-alpha');
+    let recoveries = 0;
+    const rotated: string[] = [];
+    const peer = new IscpPeer({
+      device: alpha.device,
+      grant: makeGrant(issuer, alpha.device, relay.relayId),
+      relayDescriptor: relayDescriptor(relay),
+      credentials: { accessToken: 'bogus-token', refreshToken: 'bogus-refresh' },
+      resolvePeerIdentity: async (id) => identities.get(id)!,
+      manifest: { device: 'device-alpha' },
+      provider,
+      wsFactory: relay.wsFactory,
+      fetchImpl: relay.fetchImpl,
+      onCredentialsRotated: (c) => rotated.push(c.accessToken),
+      recoverCredentials: async () => {
+        recoveries += 1;
+        return recovered;
+      },
+    });
+    beta.peer.start();
+    peer.start();
+    try {
+      await peer.openSession('device-beta', { timeoutMs: 5000 });
+      expect(recoveries).toBe(1);
+      expect(rotated).toEqual([]);
+    } finally {
+      peer.stop();
+      beta.peer.stop();
+    }
+  });
 });

@@ -76,8 +76,14 @@ export interface IscpProfileBundle {
   trust_root_descriptor: SignedDescriptor
   trust_root_pin: string
   device_identity: DeviceIdentity
-  access_credential: { token: string; expires_at: string }
-  refresh_credential: { token: string; expires_at: string }
+  /**
+   * Relay credentials with their server-side lifecycle facts. issued_at /
+   * credential_id / rotation_counter are additive (absent on older bundles):
+   * they let `happy iscp status` show REAL expiry metadata instead of the
+   * enrollment-time snapshot (OPS 2026-08-18 §8.2.4 diagnostic defect).
+   */
+  access_credential: { token: string; expires_at: string; issued_at?: string; credential_id?: string }
+  refresh_credential: { token: string; expires_at: string; issued_at?: string; credential_id?: string; rotation_counter?: number }
   trust_grant: TrustGrant
   enrolled_at: string
   /**
@@ -400,15 +406,50 @@ function writeBundleAtomic(profileId: string, bundle: IscpProfileBundle): void {
   renameSync(tempPath, file)
 }
 
+/**
+ * Rotated/recovered relay credentials with their server-side lifecycle
+ * facts. Tokens are mandatory; the metadata is applied when present so the
+ * bundle tracks the REAL current expiry, not the enrollment-time snapshot.
+ */
+export interface RotatedCredentials {
+  accessToken: string
+  refreshToken: string
+  access?: { expires_at?: string; issued_at?: string; credential_id?: string }
+  refresh?: { expires_at?: string; issued_at?: string; credential_id?: string; rotation_counter?: number }
+}
+
+function mergedCredential<T extends { token: string; expires_at: string }>(
+  current: T,
+  token: string,
+  metadata?: { expires_at?: string; issued_at?: string; credential_id?: string; rotation_counter?: number },
+): T {
+  return {
+    ...current,
+    token,
+    ...(metadata?.expires_at !== undefined ? { expires_at: metadata.expires_at } : {}),
+    ...(metadata?.issued_at !== undefined ? { issued_at: metadata.issued_at } : {}),
+    ...(metadata?.credential_id !== undefined ? { credential_id: metadata.credential_id } : {}),
+    ...(metadata?.rotation_counter !== undefined ? { rotation_counter: metadata.rotation_counter } : {}),
+  }
+}
+
+/**
+ * Persist rotated relay credentials while the caller already holds the
+ * profile lock (recovery runs its whole ladder under one lock acquisition).
+ */
+export function writeProfileCredentialsLocked(profileId: string, credentials: RotatedCredentials): void {
+  const bundle = readProfileBundle(profileId)
+  if (!bundle) return
+  bundle.access_credential = mergedCredential(bundle.access_credential, credentials.accessToken, credentials.access)
+  bundle.refresh_credential = mergedCredential(bundle.refresh_credential, credentials.refreshToken, credentials.refresh)
+  writeBundleAtomic(profileId, bundle)
+}
+
 /** Persist rotated relay credentials back into the profile bundle (0600, locked, atomic). */
-export function updateProfileCredentials(profileId: string, credentials: { accessToken: string; refreshToken: string }): void {
+export function updateProfileCredentials(profileId: string, credentials: RotatedCredentials): void {
   const release = acquireProfileLock(profileId)
   try {
-    const bundle = readProfileBundle(profileId)
-    if (!bundle) return
-    bundle.access_credential = { ...bundle.access_credential, token: credentials.accessToken }
-    bundle.refresh_credential = { ...bundle.refresh_credential, token: credentials.refreshToken }
-    writeBundleAtomic(profileId, bundle)
+    writeProfileCredentialsLocked(profileId, credentials)
   } finally {
     release()
   }

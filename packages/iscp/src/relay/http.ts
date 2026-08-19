@@ -14,6 +14,11 @@ import { IscpErrorCodes, iscpError, iscpErrorFromWire } from '../errors';
 import { createDeviceProof, type Device } from '../identity';
 import type { CryptoProvider } from '../crypto/provider';
 import {
+  RecoveredCredentialMetadataSchema,
+  WrappedRecoveredCredentialsSchema,
+  recoveryChallenge,
+} from './recoverCredentials';
+import {
   DeliveryReceiptSchema,
   SignedDescriptorSchema,
   TrustGrantSchema,
@@ -25,13 +30,22 @@ import {
 } from '../schemas';
 import * as z from 'zod';
 
-/** Access/refresh credential as issued by the reference relay. Tokens are bearer secrets — never log them. */
+/**
+ * Access/refresh credential as issued by the reference relay. Tokens are
+ * bearer secrets — never log them. The optional credential_id / issued_at /
+ * rotation_counter fields are the Infinimesh Cloud expiry facts callers must
+ * persist alongside the tokens (OPS 2026-08-18 §8.2.4): local metadata that
+ * only tracks token strings goes stale on the first rotation.
+ */
 export const RelayCredentialSchema = z.object({
   domain_id: z.string(),
   device_id: z.string(),
   token: z.string().optional(),
   expires_at: z.string(),
   revoked: z.boolean().optional(),
+  credential_id: z.string().optional(),
+  issued_at: z.string().optional(),
+  rotation_counter: z.number().int().optional(),
 });
 export type RelayCredential = z.infer<typeof RelayCredentialSchema>;
 
@@ -75,6 +89,21 @@ export const GrantRenewalSchema = z.object({
   grant: TrustGrantSchema,
 });
 export type GrantRenewal = z.infer<typeof GrantRenewalSchema>;
+
+/**
+ * 201 response of the v2 existing-device credential recovery
+ * (`POST /v2/relay/devices/recover-credentials`, InfinimeshCloud
+ * docs/10-design/12-managed-provisioning.md §11): the device record,
+ * token-free access/refresh metadata, and the sealed blob that alone
+ * carries the token plaintext.
+ */
+export const CredentialRecoverySchema = z.object({
+  data: RegisteredDeviceSchema,
+  access: RecoveredCredentialMetadataSchema,
+  refresh: RecoveredCredentialMetadataSchema,
+  credentials_wrapped: WrappedRecoveredCredentialsSchema,
+});
+export type CredentialRecovery = z.infer<typeof CredentialRecoverySchema>;
 
 export type FetchLike = (url: string, init?: {
   method?: string;
@@ -336,6 +365,56 @@ export class RelayHttpClient {
   /** POST /v2/relay/devices/refresh-access — rotates both credentials; the old refresh credential is revoked. */
   async refreshAccess(refreshToken: string): Promise<RelayCredentialPair> {
     return this.credentialCall('/v2/relay/devices/refresh-access', { refresh: refreshToken });
+  }
+
+  /**
+   * POST /v2/relay/devices/recover-credentials — Infinimesh Cloud
+   * existing-device credential recovery (frozen contract, InfinimeshCloud
+   * docs/10-design/12-managed-provisioning.md §11; ISCP#11 upstream).
+   *
+   * The MANDATORY client-generated unguessable `Idempotency-Key` and the
+   * per-attempt X25519 wrap public key together form the possession-proof
+   * challenge (`key \0 wrapPublicKey`). The 201 carries token-free metadata
+   * plus the `credentials_wrapped` blob only the wrap private key opens —
+   * use `openRecoveredCredentials` on the result.
+   *
+   * Deliberately single-shot (like autoRenewGrant): the caller persists the
+   * key, wrap key pair, and proof BEFORE the first transmission and owns the
+   * retry ladder. An unknown-outcome retry MUST reuse all three verbatim
+   * (the Cloud replays the stored ciphertext-only response); pass `proof` to
+   * resend the exact original proof, or omit it to mint a fresh proof for
+   * the same key + wrap key.
+   */
+  async recoverCredentials(
+    device: Device,
+    opts: { idempotencyKey: string; wrapPublicKey: string; proof?: DeviceProof },
+  ): Promise<CredentialRecovery> {
+    if (opts.idempotencyKey === '') {
+      throw iscpError(IscpErrorCodes.AccessInvalid, 'credential recovery requires a non-empty idempotency key');
+    }
+    if (opts.wrapPublicKey === '') {
+      throw iscpError(IscpErrorCodes.KeyInvalid, 'credential recovery requires a wrap public key');
+    }
+    const proof = opts.proof ?? createDeviceProof(this.provider, device, {
+      audience: this.relayId,
+      challenge: recoveryChallenge(opts.idempotencyKey, opts.wrapPublicKey),
+      now: this.now(),
+    });
+    const path = '/v2/relay/devices/recover-credentials';
+    const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': opts.idempotencyKey,
+      },
+      body: JSON.stringify({
+        identity: device.identity,
+        identity_proof: proof,
+        recovery_wrap_key: { kty: 'X25519', public: opts.wrapPublicKey },
+      }),
+    });
+    if (!response.ok) await parseError(response, 'credential recovery');
+    return CredentialRecoverySchema.parse(await response.json());
   }
 
   /** POST /v2/relay/devices/revoke-access — self-revocation with the device's own access credential. */

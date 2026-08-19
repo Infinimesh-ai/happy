@@ -30,7 +30,7 @@ import type { Device } from './identity';
 import { compareCodePoints } from './jcs';
 import { createNobleProvider } from './crypto/noble';
 import type { CryptoProvider } from './crypto/provider';
-import { RelayHttpClient, type FetchLike } from './relay/http';
+import { RelayHttpClient, type FetchLike, type RelayCredential, type RelayCredentialPair } from './relay/http';
 import { RelayWsClient, type RelayWsBackoff, type RelayWsState } from './relay/ws';
 import {
   SECURE_ENVELOPE_TYPE,
@@ -80,8 +80,30 @@ export interface IscpPeerOptions {
   fetchImpl?: FetchLike;
   route?: Partial<Omit<EnvelopeRoute, 'relay_id'>>;
   replayStoreFor?: (sessionId: string, peerDeviceId: string) => ReplayStore | undefined;
-  /** Called whenever access/refresh credentials rotate, so callers can persist them. */
-  onCredentialsRotated?: (credentials: { accessToken: string; refreshToken: string }) => void;
+  /**
+   * Called whenever access/refresh credentials rotate, so callers can persist
+   * them. `access`/`refresh` carry the full wire credentials (expires_at and,
+   * on Infinimesh Cloud, credential_id/issued_at/rotation_counter) so callers
+   * persist the real server expiry facts, never just token strings
+   * (OPS 2026-08-18 §8.2.4).
+   */
+  onCredentialsRotated?: (credentials: {
+    accessToken: string;
+    refreshToken: string;
+    access?: RelayCredential;
+    refresh?: RelayCredential;
+  }) => void;
+  /**
+   * Existing-device credential recovery hook (InfinimeshCloud
+   * docs/10-design/12-managed-provisioning.md §11): invoked when the refresh
+   * rotation itself fails terminally (the refresh bearer is expired or
+   * revoked — a state `refreshAccess` can never leave). The callback owns
+   * the whole recovery flow (PoP request, unseal, atomic persistence,
+   * reload bookkeeping) and returns the fresh tokens; the peer then resumes
+   * with them. It must NEVER fall back to enroll/replace. Without this hook
+   * a terminal refresh failure propagates unchanged.
+   */
+  recoverCredentials?: () => Promise<{ accessToken: string; refreshToken: string }>;
   onPayload?: (peerDeviceId: string, payloadType: string, plaintext: Uint8Array, envelope: SecureEnvelope) => void;
   /** Fires once per session when capability manifests have been exchanged. */
   onPeerReady?: (peerDeviceId: string, manifest: unknown) => void;
@@ -458,10 +480,32 @@ export class IscpPeer {
   }
 
   private async rotateCredentials(): Promise<void> {
-    const pair = await this.http.refreshAccess(this.refreshToken);
+    let pair: RelayCredentialPair;
+    try {
+      pair = await this.http.refreshAccess(this.refreshToken);
+    } catch (error) {
+      // Terminal refresh failure: the refresh bearer itself is expired or
+      // revoked, so rotation can never succeed again. Escalate to the
+      // recovery hook (device-key PoP + valid grant) when the caller wired
+      // one; the hook persisted the fresh pair itself, so onCredentialsRotated
+      // is not re-fired here.
+      if (this.opts.recoverCredentials !== undefined &&
+        error instanceof IscpError && error.code === IscpErrorCodes.AccessInvalid && !error.retryable) {
+        const recovered = await this.opts.recoverCredentials();
+        this.accessToken = recovered.accessToken;
+        this.refreshToken = recovered.refreshToken;
+        return;
+      }
+      throw error;
+    }
     this.accessToken = pair.access.token as string;
     this.refreshToken = pair.refresh.token as string;
-    this.opts.onCredentialsRotated?.({ accessToken: this.accessToken, refreshToken: this.refreshToken });
+    this.opts.onCredentialsRotated?.({
+      accessToken: this.accessToken,
+      refreshToken: this.refreshToken,
+      access: pair.access,
+      refresh: pair.refresh,
+    });
   }
 
   private now(): Date {

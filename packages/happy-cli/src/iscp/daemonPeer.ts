@@ -41,6 +41,7 @@ import {
 
 import { logger } from '@/ui/logger'
 import { listProfiles, readProfileBundle, readProfileDevice, updateProfileCredentials } from '@/iscp/enrollment'
+import { recoverProfileCredentialsNow } from '@/iscp/credentialRecovery'
 import { startSessionInitiator, type ProfilePeerStatus, type ProfileSessionState } from '@/iscp/sessionInitiator'
 import type { DaemonIscpService, SessionEventNotification, SessionLifecycleNotification } from '@/iscp/daemonIscp'
 import { WireResponder, type WireResponderDeps } from '@/iscp/wireResponder'
@@ -136,12 +137,33 @@ async function startProfilePeer(
     provider,
     onCredentialsRotated: (credentials) => {
       try {
+        // The full wire credentials carry the server's expiry facts
+        // (expires_at/issued_at/credential_id/rotation_counter) — persisted
+        // so status output reflects the REAL current lifecycle, not the
+        // enrollment-time snapshot (OPS 2026-08-18 §8.2.4).
         updateProfileCredentials(profileId, credentials)
       } catch (error) {
         // Lock contention with an in-flight enroll/renew: tokens stay valid
         // in memory; the next rotation persists them.
         logger.debug(`[ISCP PEER] credential persistence deferred for ${profileId}`, { error })
       }
+    },
+    // Terminal refresh failure (expired past the 24h TTL / revoked chain):
+    // recover with the device key + current grant instead of dying on a dead
+    // bearer (InfinimeshCloud §11). recoverProfileCredentialsNow persists the
+    // pair atomically itself; a non-recovered outcome (action-required,
+    // transient, unknown) propagates as a transport error and never falls
+    // back to enroll/replace.
+    recoverCredentials: async () => {
+      const outcome = await recoverProfileCredentialsNow({
+        profileId,
+        provider,
+        log: (line) => logger.debug(`[ISCP PEER] ${line}`),
+      })
+      if (outcome.result !== 'recovered') {
+        throw new Error(`relay credential recovery did not complete (${outcome.result}${'reason' in outcome ? `: ${outcome.reason}` : ''})`)
+      }
+      return { accessToken: outcome.accessToken, refreshToken: outcome.refreshToken }
     },
     onPeerReady: (peerDeviceId) => {
       logger.debug(`[ISCP PEER] app peer ready: ${peerDeviceId} (profile ${profileId})`)

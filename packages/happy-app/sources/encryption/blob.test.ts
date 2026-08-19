@@ -44,7 +44,10 @@ describe('blob encryption', () => {
         expect(new Uint8Array(decrypted!)).toEqual(data);
     });
 
-    it('should encrypt and decrypt a large blob (1MB)', () => {
+    // The 1MB roundtrip takes ~3.5s alone on an 8-core dev box and starves
+    // past the default 5s under full-suite worker contention — an explicit
+    // timeout keeps the correctness assertion without the load flake.
+    it('should encrypt and decrypt a large blob (1MB)', { timeout: 30_000 }, () => {
         const data = new Uint8Array(1024 * 1024);
         for (let i = 0; i < data.length; i++) data[i] = i % 256;
 

@@ -97,6 +97,7 @@ import {
   withProfileLock,
   type IscpProfileBundle,
 } from '@/iscp/enrollment'
+import { recoverProfileCredentialsNow, refreshCredentialTerminal } from '@/iscp/credentialRecovery'
 
 // ---------------------------------------------------------------------------
 // Window math (OPS §8.3: window = min(24h, grantTTL/5))
@@ -602,6 +603,27 @@ export function startDaemonAutoRenewal(opts: DaemonAutoRenewalOptions): DaemonAu
                 renewal,
               })
             })
+            // A grant renewed after a long offline gap often outlives its
+            // refresh credential (independent lifecycle, InfinimeshCloud §11):
+            // recover the relay credentials with the fresh grant BEFORE the
+            // reload, so the peers come back with a working transport instead
+            // of a valid grant over a dead bearer (the 2026-08-19 production
+            // incident). Best-effort — the terminal-401 peer hook remains the
+            // authoritative runtime trigger.
+            try {
+              const applied = inspectProfile(provider, profileId)
+              if (applied.state === 'healthy' && refreshCredentialTerminal(applied.bundle, Date.now())) {
+                opts.log(`profile ${profileId}: refresh credential is terminal after grant renewal; recovering relay credentials`)
+                await recoverProfileCredentialsNow({
+                  profileId,
+                  provider,
+                  relayUrlOverride: opts.relayUrlOverride,
+                  log: opts.log,
+                })
+              }
+            } catch (error) {
+              opts.log(`profile ${profileId}: credential recovery after grant renewal failed (${error instanceof Error ? error.message : String(error)})`)
+            }
             try {
               await opts.reloadPeers()
               opts.log(`profile ${profileId}: peers hot-reloaded with the renewed grant`)

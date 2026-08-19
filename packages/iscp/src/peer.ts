@@ -102,8 +102,13 @@ export interface IscpPeerOptions {
    * reload bookkeeping) and returns the fresh tokens; the peer then resumes
    * with them. It must NEVER fall back to enroll/replace. Without this hook
    * a terminal refresh failure propagates unchanged.
+   *
+   * `context.staleRefreshToken` is the exact bearer that just failed: the
+   * cross-process fence (OPS 2026-08-18 §10.6.2) compares it against the
+   * persisted bundle and ADOPTS a concurrent recovery instead of issuing a
+   * second logical attempt for an epoch that already ended.
    */
-  recoverCredentials?: () => Promise<{ accessToken: string; refreshToken: string }>;
+  recoverCredentials?: (context: { staleAccessToken: string; staleRefreshToken: string }) => Promise<{ accessToken: string; refreshToken: string }>;
   onPayload?: (peerDeviceId: string, payloadType: string, plaintext: Uint8Array, envelope: SecureEnvelope) => void;
   /** Fires once per session when capability manifests have been exchanged. */
   onPeerReady?: (peerDeviceId: string, manifest: unknown) => void;
@@ -491,7 +496,10 @@ export class IscpPeer {
       // is not re-fired here.
       if (this.opts.recoverCredentials !== undefined &&
         error instanceof IscpError && error.code === IscpErrorCodes.AccessInvalid && !error.retryable) {
-        const recovered = await this.opts.recoverCredentials();
+        const recovered = await this.opts.recoverCredentials({
+          staleAccessToken: this.accessToken,
+          staleRefreshToken: this.refreshToken,
+        });
         this.accessToken = recovered.accessToken;
         this.refreshToken = recovered.refreshToken;
         return;

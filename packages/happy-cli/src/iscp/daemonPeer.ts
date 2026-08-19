@@ -153,11 +153,14 @@ async function startProfilePeer(
     // bearer (InfinimeshCloud §11). recoverProfileCredentialsNow persists the
     // pair atomically itself; a non-recovered outcome (action-required,
     // transient, unknown) propagates as a transport error and never falls
-    // back to enroll/replace.
-    recoverCredentials: async () => {
+    // back to enroll/replace. The stale token is the cross-process fence
+    // (OPS 2026-08-18 §10.6.2): a recovery that another process already
+    // completed is adopted, never re-issued.
+    recoverCredentials: async ({ staleRefreshToken }) => {
       const outcome = await recoverProfileCredentialsNow({
         profileId,
         provider,
+        staleRefreshToken,
         log: (line) => logger.debug(`[ISCP PEER] ${line}`),
       })
       if (outcome.result !== 'recovered') {

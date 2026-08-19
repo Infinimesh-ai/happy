@@ -12,7 +12,7 @@
 
 import chalk from 'chalk'
 
-import { createNobleProvider, identityThumbprint, TrustRootClient, verifyTrustRootDescriptor } from '@slopus/iscp'
+import { createNobleProvider, identityThumbprint, TrustRootClient } from '@slopus/iscp'
 
 import { daemonGet } from '@/daemon/controlClient'
 import {
@@ -24,6 +24,7 @@ import {
   parseEnrollmentInput,
   readProfileBundle,
   renewProfileGrant,
+  resolveTrustDescriptorForVerification,
 } from '@/iscp/enrollment'
 import { autoRenewalStatusView, readAutoRenewalState } from '@/iscp/autoRenewal'
 import { readCredentialRecoveryState, recoverProfileCredentialsNow, refreshCredentialTerminal } from '@/iscp/credentialRecovery'
@@ -482,8 +483,12 @@ async function printCheckLayers(
   console.log(`  [2] key thumbprint: ${identityThumbprint(provider, bundle.device_identity)}`)
 
   // ③ Cloud device record: existence + the Cloud-side key matches ours.
+  // The enrolled signed descriptor is typically past its 24h validity by
+  // now, so the live check resolves a FRESH descriptor first (falling back
+  // to the enrolled one) — a stale descriptor must read as "live check
+  // unavailable", never as a device/grant failure (OPS 2026-08-18 §10.6.3).
   try {
-    const trustDescriptor = verifyTrustRootDescriptor(provider, bundle.trust_root_descriptor)
+    const trustDescriptor = await resolveTrustDescriptorForVerification(provider, bundle, {})
     const trustRoot = new TrustRootClient({ baseUrl: trustDescriptor.base_url, trustRootId: bundle.trust_root_id, domainId: bundle.domain_id, provider })
     const record = await trustRoot.deviceStatus(bundle.device_identity.device_id)
     if (record.identity.public_key.kid === bundle.device_identity.public_key.kid) {
@@ -492,7 +497,7 @@ async function printCheckLayers(
       console.log(`  [3] cloud device:   ${chalk.red('identity mismatch')} — the Cloud holds a DIFFERENT key for ${bundle.device_identity.device_id} (a later enrollment replaced this device; re-enroll here with --replace or revoke the other machine)`)
     }
   } catch (error) {
-    console.log(`  [3] cloud device:   ${chalk.yellow('unavailable')} (${error instanceof Error ? error.message : String(error)})`)
+    console.log(`  [3] cloud device:   ${chalk.yellow('live check unavailable')} (${error instanceof Error ? error.message : String(error)}; not a device failure)`)
   }
 
   // ④ Grant online status.
@@ -537,7 +542,8 @@ async function printOnlineGrantStatus(
   bundle: NonNullable<ReturnType<typeof readProfileBundle>>,
 ): Promise<void> {
   try {
-    const trustDescriptor = verifyTrustRootDescriptor(provider, bundle.trust_root_descriptor)
+    // Fresh descriptor first (fallback: enrolled) — see layer ③.
+    const trustDescriptor = await resolveTrustDescriptorForVerification(provider, bundle, {})
     const trustRoot = new TrustRootClient({
       baseUrl: trustDescriptor.base_url,
       trustRootId: bundle.trust_root_id,

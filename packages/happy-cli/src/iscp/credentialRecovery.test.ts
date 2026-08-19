@@ -432,6 +432,56 @@ describe('credential recovery', () => {
       expect(state.last_result).toBe('recovered')
     })
 
+    it('cross-process fence: a stale-token caller adopts a concurrent recovery instead of re-issuing', async () => {
+      // OPS 2026-08-18 §10.6.2: manual CLI recovery already rotated the
+      // chain; the daemon then reacts to its OLD in-memory bearer's 401.
+      // The fence sees a different, non-terminal refresh in the bundle and
+      // adopts it — zero wire calls, no second logical recovery.
+      const ticket = fixture.issueTicket()
+      const { profileId, bundle } = await enrollment.enroll({
+        relayUrl: fixture.baseUrl,
+        trustUrl: fixture.baseUrl,
+        relayId: RELAY_ID,
+        trustRootId: TRUST_ROOT_ID,
+        ticket: encodeTicketForTransport(ticket),
+        profileId: 'recover-fence',
+        log: () => {},
+      })
+      const staleRefresh = bundle.refresh_credential.token
+      // "Manual CLI" recovery rotates the chain first.
+      const first = await recovery.recoverProfileCredentialsNow({
+        profileId,
+        provider,
+        relayUrlOverride: fixture.baseUrl,
+        log: () => {},
+      })
+      expect(first.result).toBe('recovered')
+      const callsAfterManual = fixture.recoverCalls
+      // "Daemon" reacts to the old epoch's terminal 401.
+      const adopted = await recovery.recoverProfileCredentialsNow({
+        profileId,
+        provider,
+        relayUrlOverride: fixture.baseUrl,
+        staleRefreshToken: staleRefresh,
+        log: () => {},
+      })
+      expect(adopted.result).toBe('recovered')
+      if (adopted.result === 'recovered' && first.result === 'recovered') {
+        expect(adopted.refreshToken).toBe(first.refreshToken)
+      }
+      expect(fixture.recoverCalls).toBe(callsAfterManual)
+      // A caller whose stale token IS the current one still recovers.
+      const again = await recovery.recoverProfileCredentialsNow({
+        profileId,
+        provider,
+        relayUrlOverride: fixture.baseUrl,
+        staleRefreshToken: adopted.result === 'recovered' ? adopted.refreshToken : '',
+        log: () => {},
+      })
+      expect(again.result).toBe('recovered')
+      expect(fixture.recoverCalls).toBe(callsAfterManual + 1)
+    })
+
     it('a terminal grant gate stops recovery with the stable reason', async () => {
       const ticket = fixture.issueTicket()
       const { profileId } = await enrollment.enroll({

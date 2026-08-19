@@ -381,6 +381,15 @@ export interface RecoverNowOptions {
   provider?: CryptoProvider
   relayUrlOverride?: string
   force?: boolean
+  /**
+   * Cross-process fence (OPS 2026-08-18 §10.6.2): the exact refresh bearer
+   * whose terminal failure triggered this call. When the persisted bundle
+   * already holds a DIFFERENT, non-terminal refresh credential, another
+   * process (manual CLI, another daemon epoch) recovered or rotated in the
+   * meantime — the caller ADOPTS that pair instead of issuing a second
+   * logical recovery for an epoch that already ended.
+   */
+  staleRefreshToken?: string
   log: (line: string) => void
 }
 
@@ -399,6 +408,16 @@ export async function recoverProfileCredentialsNow(opts: RecoverNowOptions): Pro
       throw new Error(`ISCP profile "${opts.profileId}" is ${inspection.state === 'corrupt' ? `corrupt (${inspection.reason})` : 'not enrolled'}; credential recovery needs a healthy profile and never re-enrolls`)
     }
     const { bundle, device } = inspection
+    if (opts.staleRefreshToken !== undefined &&
+      bundle.refresh_credential.token !== opts.staleRefreshToken &&
+      !refreshCredentialTerminal(bundle, Date.now())) {
+      opts.log(`profile ${opts.profileId}: adopting a concurrent recovery/rotation — the failing refresh credential is no longer the current one`)
+      return {
+        result: 'recovered',
+        accessToken: bundle.access_credential.token,
+        refreshToken: bundle.refresh_credential.token,
+      }
+    }
     const enrolledRelay = verifyRelayDescriptor(provider, bundle.relay_descriptor, { now: new Date(bundle.enrolled_at) })
     const relayHttp = new RelayHttpClient({
       baseUrl: opts.relayUrlOverride ?? enrolledRelay.base_url,

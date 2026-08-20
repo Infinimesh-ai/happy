@@ -22,15 +22,18 @@
  * through ISCP. Fully serverless sessions are a later phase.
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod'
 
 import {
   encodeWireCursor,
   decodeWireCursor,
+  PhoneTextViewBodySchema,
+  UserMessageSchema,
   type HappyWireRequest,
   type HappyWireResponse,
   type HappyWireError,
+  type WireHistoryView,
 } from '@slopus/happy-wire'
 
 import type { TrackedSession } from '@/daemon/types'
@@ -86,11 +89,25 @@ function success(id: string, result: unknown): HappyWireResponse {
 export interface WireResponderDeps {
   iscp: DaemonIscpService
   profileId: string
+  /**
+   * History surface this peer's Trust Grant authorizes
+   * (wireViewForPermissions): 'raw' serves the internal session protocol
+   * verbatim (official Happy client), 'text' serves the materialized
+   * phone/text view — projected bubbles, view-local contiguous cursors, and
+   * a text-only write boundary (OPS 2026-08-18 §10.16).
+   */
+  view: WireHistoryView
   getChildren: () => TrackedSession[]
   stopSession: (sessionId: string) => boolean
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>
   /** Injectable for tests; defaults to global fetch. */
   fetchImpl?: typeof fetch
+}
+
+/** Short stable hash for logging opaque cursors without their content. */
+function cursorHash(cursor: string | undefined): string | null {
+  if (cursor === undefined) return null
+  return createHash('sha256').update(cursor).digest('hex').slice(0, 12)
 }
 
 export class WireResponder {
@@ -106,6 +123,24 @@ export class WireResponder {
   private readonly deliveredUserMessages = new Map<string, Set<string>>()
 
   async handle(request: HappyWireRequest): Promise<HappyWireResponse> {
+    // P1 wire logging contract: request id / method / session / result code /
+    // duration — never bodies.
+    const startedAt = Date.now()
+    const response = await this.dispatch(request)
+    const params = request.params as { sessionId?: unknown } | undefined
+    logger.debug('[WIRE RESPONDER] request handled', {
+      profileId: this.deps.profileId,
+      requestId: request.id,
+      method: request.method,
+      sessionId: typeof params?.sessionId === 'string' ? params.sessionId : null,
+      view: this.deps.view,
+      resultCode: response.ok ? 'ok' : response.error.code,
+      durationMs: Date.now() - startedAt,
+    })
+    return response
+  }
+
+  private async dispatch(request: HappyWireRequest): Promise<HappyWireResponse> {
     try {
       switch (request.method) {
         case 'sessions.list':
@@ -191,13 +226,19 @@ export class WireResponder {
       // Lifecycle contract for list consumers: show 'active' prominently,
       // fold 'idle' history away, and let 'archived' be safely hidden.
       const lifecycle = active ? 'active' : (info?.archived ?? false) ? 'archived' : 'idle'
+      // A text-view peer's cursor line lives in view coordinates: advertising
+      // the raw lastSeq here would make the phone chase seqs it can never
+      // pull (the "filtered raw cursor" trap the projection contract forbids).
+      const cursorFacts = this.deps.view === 'text' && info
+        ? this.deps.iscp.textView(this.deps.profileId).info(sessionId)
+        : info
       return {
         sessionId,
         active,
         lifecycle,
         pid: running.get(sessionId)?.pid,
-        lastSeq: info?.lastSeq ?? 0,
-        lastCursor: info ? encodeWireCursor({ scope: sessionId, seq: info.lastSeq, epoch: info.epoch }) : undefined,
+        lastSeq: cursorFacts?.lastSeq ?? 0,
+        lastCursor: cursorFacts ? encodeWireCursor({ scope: sessionId, seq: cursorFacts.lastSeq, epoch: cursorFacts.epoch }) : undefined,
         ...(info?.createdAt !== undefined ? { createdAt: info.createdAt } : {}),
         ...(info?.lastActiveAt !== undefined ? { lastActiveAt: info.lastActiveAt } : {}),
         ...(info?.displayName !== undefined ? { displayName: info.displayName } : {}),
@@ -252,19 +293,40 @@ export class WireResponder {
     if (!info) {
       return success(request.id, { events: [], hasMore: false, lastCursor: null, reset: false })
     }
+    const epoch = this.deps.view === 'text'
+      ? this.deps.iscp.textView(this.deps.profileId).info(params.sessionId)!.epoch
+      : info.epoch
     // Cursor validation: wrong scope or stale epoch → full re-sync from 0,
-    // flagged so the client knows to discard local state.
+    // flagged so the client knows to discard local state. For a text-view
+    // peer the epoch is the VIEW epoch — a projector rebuild invalidates the
+    // phone's cursor even when the raw log kept its own.
     let afterSeq = 0
     let reset = false
     if (params.afterCursor !== undefined) {
       const cursor = decodeWireCursor(params.afterCursor)
-      if (cursor !== null && cursor.scope === params.sessionId && cursor.epoch === info.epoch) {
+      if (cursor !== null && cursor.scope === params.sessionId && cursor.epoch === epoch) {
         afterSeq = cursor.seq
       } else {
         reset = true
       }
     }
-    const page = log.read(params.sessionId, afterSeq, params.limit ?? 200)!
+    const limit = params.limit ?? 200
+    const page = this.deps.view === 'text'
+      ? this.readTextPage(params.sessionId, afterSeq, limit)
+      : log.read(params.sessionId, afterSeq, limit)!
+    logger.debug('[WIRE RESPONDER] messages.pull', {
+      profileId: this.deps.profileId,
+      requestId: request.id,
+      sessionId: params.sessionId,
+      view: this.deps.view,
+      afterCursorHash: cursorHash(params.afterCursor),
+      afterSeq,
+      returnedRange: page.events.length > 0 ? [page.events[0].seq, page.events[page.events.length - 1].seq] : null,
+      returnedCount: page.events.length,
+      reset,
+      hasMore: page.hasMore,
+      lastSeq: page.lastSeq,
+    })
     return success(request.id, {
       events: page.events.map((event) => ({
         seq: event.seq,
@@ -279,11 +341,47 @@ export class WireResponder {
     })
   }
 
+  /**
+   * Text-view history page in the raw page's shape (seq/localId/body/at).
+   * Every body is re-validated against the published view schema — the
+   * responder never emits anything that does not pass it (fail-closed).
+   */
+  private readTextPage(sessionId: string, afterSeq: number, limit: number): {
+    events: Array<{ seq: number; localId?: string; body: unknown; at: number }>
+    lastSeq: number
+    epoch: string
+    hasMore: boolean
+  } {
+    const page = this.deps.iscp.textView(this.deps.profileId).read(sessionId, afterSeq, limit)!
+    return {
+      events: page.events
+        .filter((event) => PhoneTextViewBodySchema.safeParse(event.body).success)
+        .map((event) => ({
+          seq: event.viewSeq,
+          ...(event.localId !== undefined ? { localId: event.localId } : {}),
+          body: event.body,
+          at: event.at,
+        })),
+      lastSeq: page.lastSeq,
+      epoch: page.epoch,
+      hasMore: page.hasMore,
+    }
+  }
+
   private async messagesSend(request: HappyWireRequest): Promise<HappyWireResponse> {
     const params = MessagesSendParams.parse(request.params)
     const localId = request.idempotencyKey
     if (localId === undefined || localId === '') {
       return failure(request.id, 'invalid', 'messages.send requires an idempotencyKey')
+    }
+    // Write boundary for a text-permission grant: only plain user text may
+    // enter the log. Anything else is rejected before persistence — the
+    // permission gate cuts both directions.
+    if (this.deps.view === 'text') {
+      const userText = UserMessageSchema.safeParse(params.body)
+      if (!userText.success || userText.data.content.text === '') {
+        return failure(request.id, 'invalid', 'this grant only permits plain text user messages')
+      }
     }
     // Persist first (idempotent outbox), but success means DELIVERED to the
     // agent, not persisted: a send whose forward fails returns 'retryable'
@@ -309,6 +407,22 @@ export class WireResponder {
       }
       deliveredSet.add(localId)
       logger.debug('[WIRE RESPONDER] user message delivered', { sessionId: params.sessionId, seq: result.seq })
+    }
+    // A text-view peer's ack cursor must live on the VIEW seq line (same
+    // localId), or its next pull would resume from a raw seq it cannot see.
+    if (this.deps.view === 'text') {
+      const view = this.deps.iscp.textView(this.deps.profileId)
+      const viewSeq = view.viewSeqForLocalId(params.sessionId, localId)
+      const viewInfo = view.info(params.sessionId)
+      if (viewSeq === null || viewInfo === null) {
+        return failure(request.id, 'retryable', 'message persisted but not yet visible in the text view; retry with the same idempotencyKey')
+      }
+      return success(request.id, {
+        seq: viewSeq,
+        deduped: result.deduped,
+        delivery: 'delivered',
+        cursor: encodeWireCursor({ scope: params.sessionId, seq: viewSeq, epoch: viewInfo.epoch }),
+      })
     }
     return success(request.id, {
       seq: result.seq,

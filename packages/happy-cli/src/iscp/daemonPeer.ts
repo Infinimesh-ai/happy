@@ -24,6 +24,7 @@ import {
   HappyWireRequestSchema,
   defaultAgentCapabilityManifest,
   encodeWireCursor,
+  wireViewForPermissions,
   type MachineWireEvent,
   type SessionWireEvent,
 } from '@slopus/happy-wire'
@@ -43,7 +44,7 @@ import { logger } from '@/ui/logger'
 import { listProfiles, readProfileBundle, readProfileDevice, updateProfileCredentials } from '@/iscp/enrollment'
 import { recoverProfileCredentialsNow } from '@/iscp/credentialRecovery'
 import { startSessionInitiator, type ProfilePeerStatus, type ProfileSessionState } from '@/iscp/sessionInitiator'
-import type { DaemonIscpService, SessionEventNotification, SessionLifecycleNotification } from '@/iscp/daemonIscp'
+import type { DaemonIscpService, SessionEventNotification, SessionLifecycleNotification, TextViewEventNotification } from '@/iscp/daemonIscp'
 import { WireResponder, type WireResponderDeps } from '@/iscp/wireResponder'
 
 export type { ProfilePeerStatus, ProfileSessionState } from '@/iscp/sessionInitiator'
@@ -70,7 +71,7 @@ interface ProfilePeerHandle {
  * daemon must keep serving legacy traffic regardless.
  */
 export async function startDaemonIscpPeers(
-  deps: Omit<WireResponderDeps, 'profileId'>,
+  deps: Omit<WireResponderDeps, 'profileId' | 'view'>,
 ): Promise<DaemonIscpPeers> {
   const provider = createNobleProvider()
   const handles: ProfilePeerHandle[] = []
@@ -95,7 +96,7 @@ export async function startDaemonIscpPeers(
 async function startProfilePeer(
   provider: CryptoProvider,
   profileId: string,
-  deps: Omit<WireResponderDeps, 'profileId'>,
+  deps: Omit<WireResponderDeps, 'profileId' | 'view'>,
 ): Promise<ProfilePeerHandle | null> {
   const bundle = readProfileBundle(profileId)
   const device = readProfileDevice(provider, profileId)
@@ -117,7 +118,12 @@ async function startProfilePeer(
   const enrolledTrust = verifyTrustRootDescriptor(provider, bundle.trust_root_descriptor, { now: new Date(bundle.enrolled_at) })
   const trustRoot = new TrustRootClient({ baseUrl: enrolledTrust.base_url, trustRootId: bundle.trust_root_id, domainId: bundle.domain_id, provider })
 
-  const responder = new WireResponder({ ...deps, profileId })
+  // The Trust Grant's permission set decides which history surface this
+  // profile's peers may see: only an explicit raw-session permission gets
+  // the internal session protocol; the production phone grant (['text'])
+  // gets the projected text view (OPS 2026-08-18 §10.16, fail-closed).
+  const view = wireViewForPermissions(bundle.trust_grant.permissions)
+  const responder = new WireResponder({ ...deps, profileId, view })
   const subscribedPeers = new Set<string>()
 
   const peer: IscpPeer = new IscpPeer({
@@ -177,9 +183,18 @@ async function startProfilePeer(
         const request = HappyWireRequestSchema.parse(JSON.parse(utf8Decode(plaintext)))
         if (request.method === 'events.subscribe') {
           subscribedPeers.add(peerDeviceId)
+          logger.debug('[ISCP PEER] events.subscribe', { profileId, peerDeviceId, view, subscriberCount: subscribedPeers.size })
         }
         const response = await responder.handle(request)
-        await peer.sendPayload(peerDeviceId, WIRE_RESPONSE_PAYLOAD_TYPE, utf8Encode(JSON.stringify(response)))
+        try {
+          await peer.sendPayload(peerDeviceId, WIRE_RESPONSE_PAYLOAD_TYPE, utf8Encode(JSON.stringify(response)))
+        } catch (error) {
+          // P1 logging contract: response submission success/failure must be
+          // distinguishable from "responder never answered".
+          logger.debug('[ISCP PEER] wire response submit failed', { profileId, peerDeviceId, requestId: request.id, method: request.method, error })
+          throw error
+        }
+        logger.debug('[ISCP PEER] wire response submitted', { profileId, peerDeviceId, requestId: request.id, method: request.method, resultCode: response.ok ? 'ok' : response.error.code })
       })().catch((error) => {
         logger.debug('[ISCP PEER] wire request handling failed', { peerDeviceId, error })
       })
@@ -228,23 +243,50 @@ async function startProfilePeer(
   }
   deps.iscp.events.on('session-lifecycle', onSessionLifecycle)
 
+  // Chat history push branches on the grant's view: raw peers get the
+  // internal protocol events verbatim (unchanged behavior), text peers get
+  // ONLY materialized text-view records — same projector and store as
+  // messages.pull, in view coordinates, so live and history can never
+  // disagree (OPS 2026-08-18 §10.16).
+  const pushWireEvent = (event: SessionWireEvent, eventKind: string) => {
+    for (const peerDeviceId of subscribedPeers) {
+      peer.sendPayload(peerDeviceId, WIRE_EVENT_PAYLOAD_TYPE, utf8Encode(JSON.stringify(event)))
+        .then(() => {
+          logger.debug('[ISCP PEER] event push submitted', { profileId, peerDeviceId, sessionId: event.sessionId, seq: event.seq, eventKind, view })
+        })
+        .catch((error) => {
+          // No retry here by design: the phone recovers via messages.pull
+          // from its cursor; the log line is what distinguishes "projected
+          // but never submitted" from "phone never caught up".
+          logger.debug('[ISCP PEER] event push failed (peer recovers via pull)', { profileId, peerDeviceId, sessionId: event.sessionId, seq: event.seq, eventKind, view, error })
+        })
+    }
+  }
   const onSessionEvent = (notification: SessionEventNotification) => {
-    if (notification.profileId !== profileId || notification.deduped) return
-    const event: SessionWireEvent = {
+    if (view !== 'raw' || notification.profileId !== profileId || notification.deduped) return
+    pushWireEvent({
       type: 'session-event',
       sessionId: notification.sessionId,
       seq: notification.record.seq,
       cursor: encodeWireCursor({ scope: notification.sessionId, seq: notification.record.seq, epoch: notification.epoch }),
       ...(notification.record.localId !== undefined ? { localId: notification.record.localId } : {}),
       body: notification.record.body,
-    }
-    for (const peerDeviceId of subscribedPeers) {
-      peer.sendPayload(peerDeviceId, WIRE_EVENT_PAYLOAD_TYPE, utf8Encode(JSON.stringify(event))).catch((error) => {
-        logger.debug('[ISCP PEER] event push failed', { peerDeviceId, error })
-      })
-    }
+    }, 'raw-session-event')
   }
   deps.iscp.events.on('session-event', onSessionEvent)
+
+  const onTextViewEvent = (notification: TextViewEventNotification) => {
+    if (view !== 'text' || notification.profileId !== profileId) return
+    pushWireEvent({
+      type: 'session-event',
+      sessionId: notification.sessionId,
+      seq: notification.record.viewSeq,
+      cursor: encodeWireCursor({ scope: notification.sessionId, seq: notification.record.viewSeq, epoch: notification.viewEpoch }),
+      ...(notification.record.localId !== undefined ? { localId: notification.record.localId } : {}),
+      body: notification.record.body,
+    }, 'text-view-event')
+  }
+  deps.iscp.events.on('text-view-event', onTextViewEvent)
 
   peer.start()
   logger.debug(`[ISCP PEER] profile ${profileId} online as device ${device.identity.device_id}`)
@@ -281,6 +323,7 @@ async function startProfilePeer(
       // Settle any pending openSession so the loop terminates promptly.
       peer.closeSession(audience)
       deps.iscp.events.off('session-event', onSessionEvent)
+      deps.iscp.events.off('text-view-event', onTextViewEvent)
       deps.iscp.events.off('session-lifecycle', onSessionLifecycle)
       peer.stop()
     },

@@ -11,3 +11,4 @@ export * from './wire/error';
 export * from './wire/cursor';
 export * from './wire/capability';
 export * from './wire/payloadTypes';
+export * from './wire/textView';

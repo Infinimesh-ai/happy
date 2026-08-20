@@ -11,6 +11,11 @@
  * messages.send idempotency (same key = one log entry) → cursor resume +
  * stale-epoch reset → live event push after events.subscribe → relay access
  * revocation refused.
+ *
+ * The harness grant carries permissions ['text'] (same as the production
+ * phone grant), so this exercises the TEXT VIEW surface end to end: sends
+ * must be plain user text, internal protocol events are never pushed or
+ * pulled, and all seqs/cursors are view coordinates (OPS 2026-08-18 §10.16).
  */
 
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -66,6 +71,9 @@ describe.runIf(enabled)('daemon ISCP stack over the reference harness', () => {
         spawned.push(options.environmentVariables?.HAPPY_NETWORK_PROFILE ?? '')
         return { type: 'success' as const, sessionId: 'sess-e2e' }
       },
+      // messages.send success means DELIVERED to the agent; there is no real
+      // agent process in this harness, so stub the localhost RPC forward.
+      fetchImpl: (async () => new Response(JSON.stringify({ ok: true, result: null }), { status: 200 })) as unknown as typeof fetch,
     })
     stops.push(peers.stop)
     expect(peers.profiles).toContain(profileId)
@@ -133,25 +141,42 @@ describe.runIf(enabled)('daemon ISCP stack over the reference harness', () => {
     expect(spawn).toMatchObject({ ok: true, result: { sessionId: 'sess-e2e' } })
     expect(spawned).toEqual([profileId])
 
-    // --- 5. messages.send idempotency: same key twice → one log entry. ---
-    const send1 = await request('messages.send', { sessionId: 'sess-e2e', body: { t: 'user-msg' } }, 'msg-key-1')
-    const send2 = await request('messages.send', { sessionId: 'sess-e2e', body: { t: 'user-msg' } }, 'msg-key-1')
+    // --- 5. messages.send idempotency: same key twice → one log entry. The
+    // text-permission grant only admits plain user text; anything else is
+    // rejected at the boundary before persistence. ---
+    // The scripted spawn never registers an agent bridge; delivery-confirmed
+    // sends need one (the forward itself is stubbed via fetchImpl above).
+    iscp.registerSessionRpcPort(profileId, 'sess-e2e', 1)
+    const rejected = await request('messages.send', { sessionId: 'sess-e2e', body: { t: 'user-msg' } }, 'msg-key-0')
+    expect(rejected).toMatchObject({ ok: false, error: { code: 'invalid' } })
+
+    const userBody = { role: 'user', content: { type: 'text', text: 'user-msg' }, localKey: 'msg-key-1' }
+    const send1 = await request('messages.send', { sessionId: 'sess-e2e', body: userBody }, 'msg-key-1')
+    const send2 = await request('messages.send', { sessionId: 'sess-e2e', body: userBody }, 'msg-key-1')
     expect(send1).toMatchObject({ ok: true, result: { seq: 1, deduped: false } })
     expect(send2).toMatchObject({ ok: true, result: { seq: 1, deduped: true } })
 
     const pull1 = await request('messages.pull', { sessionId: 'sess-e2e' })
-    const page1 = pull1.result as { events: Array<{ seq: number; cursor: string; localId?: string }>; reset: boolean }
+    const page1 = pull1.result as { events: Array<{ seq: number; cursor: string; localId?: string; body?: unknown }>; reset: boolean }
     expect(page1.events).toHaveLength(1)
     expect(page1.events[0].localId).toBe('msg-key-1')
+    expect(page1.events[0].body).toEqual(userBody)
 
-    // --- 6. events.subscribe → tee ingestion is pushed live with localId. ---
+    // --- 6. events.subscribe → tee ingestion is pushed live with localId.
+    // Internal protocol events (turn-start here) are projected away: only the
+    // agent's visible text reaches the phone, in view coordinates. ---
     await request('events.subscribe', {})
-    iscp.ingest(profileId, 'sess-e2e', [{ localId: 'agent-evt-1', body: { t: 'agent-msg' } }])
+    iscp.ingest(profileId, 'sess-e2e', [
+      { localId: 'agent-turn-1', body: { role: 'session', content: { id: 'hzg7p120nbryhqjpmljgqtk3', time: 1, role: 'agent', turn: 'wkiyvih5h2q4yhzgh6cqakst', ev: { t: 'turn-start' } } } },
+      { localId: 'agent-evt-1', body: { role: 'session', content: { id: 'ori39x6jae2tofh4lglcwlio', time: 2, role: 'agent', turn: 'wkiyvih5h2q4yhzgh6cqakst', ev: { t: 'text', text: 'agent-msg' } } } },
+    ])
     const pushDeadline = Date.now() + 15_000
     while (liveEvents.length === 0 && Date.now() < pushDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 50))
     }
     expect(liveEvents[0]).toMatchObject({ sessionId: 'sess-e2e', seq: 2, localId: 'agent-evt-1' })
+    expect((liveEvents[0] as { body?: unknown }).body).toEqual({ role: 'agent', content: { type: 'text', text: 'agent-msg' } })
+    expect(liveEvents).toHaveLength(1)
 
     // --- 7. Cursor resume + stale-epoch reset. ---
     const pull2 = await request('messages.pull', { sessionId: 'sess-e2e', afterCursor: page1.events[0].cursor })

@@ -25,6 +25,7 @@ describe('WireResponder', () => {
   const build = (overrides?: Partial<WireResponderDeps>) => new WireResponder({
     iscp,
     profileId: 'p1',
+    view: 'raw',
     getChildren: () => [],
     stopSession,
     spawnSession,
@@ -222,6 +223,7 @@ describe('WireResponder', () => {
     const freshResponder = new WireResponder({
       iscp: restarted,
       profileId: 'p1',
+      view: 'raw',
       getChildren: () => [],
       stopSession,
       spawnSession,
@@ -271,5 +273,183 @@ describe('WireResponder', () => {
     iscp.ingest('p1', 'sess-known', [{ body: {} }])
     const offline = await responder.handle({ id: 'r2', method: 'session.rpc', params: { sessionId: 'sess-known', method: 'abort', params: {} } })
     expect(offline).toMatchObject({ ok: false, error: { code: 'retryable' } })
+  })
+
+  // -------------------------------------------------------------------------
+  // Text view (grant permission = 'text'): the phone-facing projection of
+  // OPS 2026-08-18 §10.16. The raw internal session protocol must never
+  // reach these peers; cursors live in view coordinates.
+  // -------------------------------------------------------------------------
+  describe('text view', () => {
+    const textBuild = (overrides?: Partial<WireResponderDeps>) => build({ view: 'text', ...overrides })
+
+    /** The agent-side raw events of the production Codex exchange (seq 2–8). */
+    const agentRawEvents = (reply: string) => [
+      { localId: 'a-1', body: { role: 'session', content: { id: 'hzg7p120nbryhqjpmljgqtk3', time: 1, role: 'agent', turn: 'wkiyvih5h2q4yhzgh6cqakst', ev: { t: 'turn-start' } }, meta: { sentFrom: 'cli' } } },
+      { localId: 'a-2', body: { role: 'session', content: { id: 'p88navwp70szsuwxjfrvd77v', time: 2, role: 'agent', usage: { input_tokens: 1, output_tokens: 1 }, ev: { t: 'service', text: '' } }, meta: { sentFrom: 'cli' } } },
+      { localId: 'a-3', body: { role: 'session', content: { id: 'ori39x6jae2tofh4lglcwlio', time: 3, role: 'agent', turn: 'wkiyvih5h2q4yhzgh6cqakst', ev: { t: 'text', text: reply } }, meta: { sentFrom: 'cli' } } },
+      { localId: 'a-4', body: { role: 'session', content: { id: 'wt3ioyd9hd300nseqgo2l92v', time: 4, role: 'agent', turn: 'wkiyvih5h2q4yhzgh6cqakst', ev: { t: 'turn-end', status: 'completed' } }, meta: { sentFrom: 'cli' } } },
+      { localId: 'a-5', body: { role: 'agent', content: { id: 'f7dfeb45-1cd9-4a9a-b703-a40042078b23', type: 'event', data: { type: 'ready' } } } },
+      { localId: 'a-6', body: { role: 'session', content: { id: 'iszvgosmrb33ngsforko9zay', time: 5, role: 'agent', usage: { input_tokens: 1, output_tokens: 1 }, ev: { t: 'text', text: 'internal', thinking: true } }, meta: { sentFrom: 'cli' } } },
+    ]
+
+    it('serves exactly one user and one agent bubble for the Codex exchange, with contiguous view seqs', async () => {
+      iscp.registerSessionRpcPort('p1', 's1', 4242)
+      const textResponder = textBuild({ fetchImpl: okFetch as unknown as typeof fetch })
+      const send = await textResponder.handle({
+        id: 'r1',
+        method: 'messages.send',
+        params: { sessionId: 's1', body: { role: 'user', content: { type: 'text', text: '你好' }, localKey: 'jingsi-1' } },
+        idempotencyKey: 'jingsi-1',
+      })
+      expect(send).toMatchObject({ ok: true, result: { seq: 1, delivery: 'delivered' } })
+      iscp.ingest('p1', 's1', agentRawEvents('你好！有什么我可以帮你处理的？'))
+
+      const pull = await textResponder.handle({ id: 'r2', method: 'messages.pull', params: { sessionId: 's1' } })
+      const result = (pull as { ok: true; result: { events: Array<{ seq: number; localId?: string; body: unknown; cursor: string }>; reset: boolean; lastCursor: string } }).result
+      expect(result.events.map((e) => e.seq)).toEqual([1, 2])
+      expect(result.events[0]).toMatchObject({
+        localId: 'jingsi-1',
+        body: { role: 'user', content: { type: 'text', text: '你好' }, localKey: 'jingsi-1' },
+      })
+      expect(result.events[1].body).toEqual({ role: 'agent', content: { type: 'text', text: '你好！有什么我可以帮你处理的？' } })
+      // Nothing else leaks: no turn/service/usage/ready/thinking JSON.
+      expect(JSON.stringify(result.events)).not.toContain('turn-start')
+      expect(JSON.stringify(result.events)).not.toContain('"usage"')
+      expect(JSON.stringify(result.events)).not.toContain('ready')
+      expect(JSON.stringify(result.events)).not.toContain('internal')
+
+      // The send ack cursor is the view cursor of the user bubble.
+      const ack = (send as { ok: true; result: { cursor: string } }).result.cursor
+      expect(decodeWireCursor(ack)).toMatchObject({ scope: 's1', seq: 1 })
+      expect(decodeWireCursor(ack)!.epoch).toBe(decodeWireCursor(result.lastCursor)!.epoch)
+    })
+
+    it('rejects non-text send bodies at the permission boundary before persisting', async () => {
+      iscp.registerSessionRpcPort('p1', 's1', 4242)
+      const textResponder = textBuild({ fetchImpl: okFetch as unknown as typeof fetch })
+      const rejected = await textResponder.handle({
+        id: 'r1',
+        method: 'messages.send',
+        params: { sessionId: 's1', body: { role: 'agent', content: { type: 'tool-call', name: 'Bash' } } },
+        idempotencyKey: 'k-bad',
+      })
+      expect(rejected).toMatchObject({ ok: false, error: { code: 'invalid' } })
+      expect(iscp.log('p1').sessionInfo('s1')).toBeNull()
+      expect(okFetch).not.toHaveBeenCalled()
+    })
+
+    it('uses view coordinates for cursors: raw-epoch cursors reset, view cursors resume', async () => {
+      iscp.registerSessionRpcPort('p1', 's1', 4242)
+      const textResponder = textBuild({ fetchImpl: okFetch as unknown as typeof fetch })
+      await textResponder.handle({
+        id: 'r1',
+        method: 'messages.send',
+        params: { sessionId: 's1', body: { role: 'user', content: { type: 'text', text: 'one' } } },
+        idempotencyKey: 'k1',
+      })
+      iscp.ingest('p1', 's1', agentRawEvents('reply one'))
+
+      const pull = await textResponder.handle({ id: 'r2', method: 'messages.pull', params: { sessionId: 's1' } })
+      const r1 = (pull as { ok: true; result: { events: Array<{ cursor: string }>; reset: boolean } }).result
+      expect(r1.reset).toBe(false)
+
+      // Resume from the user bubble's view cursor → only the agent bubble.
+      const resumed = await textResponder.handle({ id: 'r3', method: 'messages.pull', params: { sessionId: 's1', afterCursor: r1.events[0].cursor } })
+      const r2 = (resumed as { ok: true; result: { events: Array<{ seq: number; body: unknown }>; reset: boolean } }).result
+      expect(r2.reset).toBe(false)
+      expect(r2.events.map((e) => e.seq)).toEqual([2])
+
+      // A cursor minted on the RAW epoch line (the "filtered raw cursor"
+      // trap) must invalidate and trigger a full view re-sync.
+      const rawEpoch = iscp.log('p1').sessionInfo('s1')!.epoch
+      const viewCursor = decodeWireCursor(r1.events[0].cursor)!
+      const rawStyleCursor = r1.events[0].cursor.replace(viewCursor.epoch, rawEpoch)
+      const reset = await textResponder.handle({ id: 'r4', method: 'messages.pull', params: { sessionId: 's1', afterCursor: rawStyleCursor } })
+      const r3 = (reset as { ok: true; result: { events: unknown[]; reset: boolean } }).result
+      expect(r3.reset).toBe(true)
+      expect(r3.events).toHaveLength(2)
+    })
+
+    it('sessions.list advertises view seq/cursor facts to text peers', async () => {
+      iscp.registerSessionRpcPort('p1', 's1', 4242)
+      const textResponder = textBuild({ fetchImpl: okFetch as unknown as typeof fetch })
+      await textResponder.handle({
+        id: 'r1',
+        method: 'messages.send',
+        params: { sessionId: 's1', body: { role: 'user', content: { type: 'text', text: 'one' } } },
+        idempotencyKey: 'k1',
+      })
+      iscp.ingest('p1', 's1', agentRawEvents('reply'))
+
+      const list = await textResponder.handle({ id: 'l', method: 'sessions.list', params: {} })
+      const session = (list as { ok: true; result: { sessions: Array<{ sessionId: string; lastSeq: number; lastCursor?: string }> } })
+        .result.sessions.find((s) => s.sessionId === 's1')!
+      // Raw log holds 7 events; the view holds 2 bubbles.
+      expect(iscp.log('p1').sessionInfo('s1')!.lastSeq).toBe(7)
+      expect(session.lastSeq).toBe(2)
+      const cursor = decodeWireCursor(session.lastCursor!)!
+      expect(cursor.seq).toBe(2)
+      expect(cursor.epoch).not.toBe(iscp.log('p1').sessionInfo('s1')!.epoch)
+    })
+
+    it('live push and pull share the materialized view (same seq, idempotent overlap)', async () => {
+      iscp.registerSessionRpcPort('p1', 's1', 4242)
+      const textResponder = textBuild({ fetchImpl: okFetch as unknown as typeof fetch })
+      const live: Array<{ sessionId: string; record: { viewSeq: number; body: unknown }; viewEpoch: string }> = []
+      iscp.events.on('text-view-event', (n: { sessionId: string; record: { viewSeq: number; body: unknown }; viewEpoch: string }) => live.push(n))
+
+      await textResponder.handle({
+        id: 'r1',
+        method: 'messages.send',
+        params: { sessionId: 's1', body: { role: 'user', content: { type: 'text', text: 'ping' } } },
+        idempotencyKey: 'k1',
+      })
+      iscp.ingest('p1', 's1', agentRawEvents('pong'))
+
+      // Live saw exactly the two bubbles, in view coordinates.
+      expect(live.map((n) => n.record.viewSeq)).toEqual([1, 2])
+      expect(live[1].record.body).toEqual({ role: 'agent', content: { type: 'text', text: 'pong' } })
+
+      // Overlap: pulling the same range yields the same seqs and bodies — the
+      // app can dedupe by cursor with no divergence between push and pull.
+      const pull = await textResponder.handle({ id: 'r2', method: 'messages.pull', params: { sessionId: 's1' } })
+      const events = (pull as { ok: true; result: { events: Array<{ seq: number; body: unknown }> } }).result.events
+      expect(events.map((e) => e.seq)).toEqual(live.map((n) => n.record.viewSeq))
+      expect(events[1].body).toEqual(live[1].record.body)
+
+      // Re-ingesting the same localIds (agent retry) appends nothing new.
+      iscp.ingest('p1', 's1', agentRawEvents('pong'))
+      expect(live.map((n) => n.record.viewSeq)).toEqual([1, 2])
+    })
+
+    it('daemon restart keeps the view epoch and seq line stable', async () => {
+      iscp.registerSessionRpcPort('p1', 's1', 4242)
+      const textResponder = textBuild({ fetchImpl: okFetch as unknown as typeof fetch })
+      await textResponder.handle({
+        id: 'r1',
+        method: 'messages.send',
+        params: { sessionId: 's1', body: { role: 'user', content: { type: 'text', text: 'before restart' } } },
+        idempotencyKey: 'k1',
+      })
+      const before = await textResponder.handle({ id: 'r2', method: 'messages.pull', params: { sessionId: 's1' } })
+      const beforeResult = (before as { ok: true; result: { lastCursor: string } }).result
+
+      const restarted = new DaemonIscpService((profileId) => join(root, profileId))
+      const freshResponder = new WireResponder({
+        iscp: restarted,
+        profileId: 'p1',
+        view: 'text',
+        getChildren: () => [],
+        stopSession,
+        spawnSession,
+      })
+      restarted.ingest('p1', 's1', agentRawEvents('after restart'))
+      const after = await freshResponder.handle({ id: 'r3', method: 'messages.pull', params: { sessionId: 's1', afterCursor: beforeResult.lastCursor } })
+      const afterResult = (after as { ok: true; result: { events: Array<{ seq: number; body: unknown }>; reset: boolean } }).result
+      expect(afterResult.reset).toBe(false)
+      expect(afterResult.events.map((e) => e.seq)).toEqual([2])
+      expect(afterResult.events[0].body).toEqual({ role: 'agent', content: { type: 'text', text: 'after restart' } })
+    })
   })
 })

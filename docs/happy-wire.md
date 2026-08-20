@@ -45,6 +45,15 @@ Current session wire payload shape (decrypted message body):
 - envelope-level role remains inside `content.role` (`'user' | 'agent'`)
 - envelope timestamp is required as `content.time` (Unix ms)
 
+### 3. Phone text view (`happy/phone-text-view.v1`)
+
+Shared from `wire/textView.ts` (OPS 2026-08-18 §10.16):
+- `PhoneTextViewBodySchema` (`PhoneTextViewUserBodySchema` / `PhoneTextViewAgentBodySchema`) — the ONLY bodies a text-permission ISCP peer may receive: `{role:'user'|'agent', content:{type:'text', text}}` (user bodies keep `localKey`).
+- `projectPhoneTextView(rawBody)` — the single pure projector from internal event-log bodies to the view. Emits only visible agent text (modern session envelopes, `ev.t='text'`, non-thinking, non-subagent) and user text; everything else (turn/service/usage/ready/tool/file/legacy `output`/`codex`/`acp`/unknown) is dropped with a machine-readable kind — never stringified into a fake chat message.
+- `wireViewForPermissions(permissions)` — maps a Trust Grant permission set to `'raw' | 'text'`. Only the explicit `happy.raw-session` permission gets the internal session protocol; everything else (including the production phone grant `['text']`) fails closed to the text view.
+
+The daemon materializes this view per session with its own contiguous seq/cursor/epoch (`packages/happy-cli/src/iscp/textViewLog.ts`); `messages.pull`, `messages.send` acks, `sessions.list` cursor facts and live `happy/wire-event.v1` pushes all live in view coordinates for text peers. The raw event log is unchanged and stays the canonical history for the official Happy client.
+
 ## Migration in this repository
 
 ### CLI (`packages/happy-cli`)

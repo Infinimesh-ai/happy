@@ -9,6 +9,8 @@ import { join } from 'node:path'
 
 import { iscpProfileDir } from '@/iscp/enrollment'
 import { DaemonEventLog, type EventLogAppendResult, type EventLogRecord } from '@/iscp/eventLog'
+import { TextViewLog, type TextViewRecord } from '@/iscp/textViewLog'
+import { logger } from '@/ui/logger'
 
 export interface IngestedSessionEvent {
   localId?: string
@@ -31,14 +33,29 @@ export interface SessionLifecycleNotification {
   reason: 'session_created' | 'agent_reachable' | 'agent_unreachable'
 }
 
+/**
+ * A newly materialized phone/text-view record (OPS 2026-08-18 §10.16). Fired
+ * regardless of which entry point triggered the projection, so live push
+ * never depends on WHO caused the catch-up. Text-view peers subscribe to
+ * this instead of 'session-event'.
+ */
+export interface TextViewEventNotification {
+  profileId: string
+  sessionId: string
+  record: TextViewRecord
+  viewEpoch: string
+}
+
 export class DaemonIscpService {
   /** Injectable for tests; defaults to the enrolled profile directory. */
   constructor(private readonly profileDirFor: (profileId: string) => string = iscpProfileDir) {}
 
   private readonly logs = new Map<string, DaemonEventLog>()
+  private readonly textViews = new Map<string, TextViewLog>()
   /**
-   * Emits 'session-event' with SessionEventNotification and
-   * 'session-lifecycle' with SessionLifecycleNotification for live subscribers.
+   * Emits 'session-event' with SessionEventNotification, 'session-lifecycle'
+   * with SessionLifecycleNotification and 'text-view-event' with
+   * TextViewEventNotification for live subscribers.
    */
   readonly events = new EventEmitter()
   /** sessionId → localhost RPC port of the running ISCP session process. */
@@ -118,6 +135,35 @@ export class DaemonIscpService {
     return log
   }
 
+  /**
+   * The materialized phone/text view over a profile's event log. Projection
+   * traces go to the daemon log WITHOUT body content (P1 logging contract);
+   * appended records fan out as 'text-view-event'.
+   */
+  textView(profileId: string): TextViewLog {
+    let view = this.textViews.get(profileId)
+    if (!view) {
+      const log = this.log(profileId)
+      view = new TextViewLog(
+        log,
+        join(this.profileDirFor(profileId), 'eventlog'),
+        (trace) => {
+          logger.debug('[TEXT VIEW] projected', { profileId, ...trace })
+        },
+        (sessionId, record, viewEpoch) => {
+          this.events.emit('text-view-event', {
+            profileId,
+            sessionId,
+            record,
+            viewEpoch,
+          } satisfies TextViewEventNotification)
+        },
+      )
+      this.textViews.set(profileId, view)
+    }
+    return view
+  }
+
   /** Ingest a batch of session events (idempotent per localId). */
   ingest(profileId: string, sessionId: string, events: IngestedSessionEvent[]): EventLogAppendResult[] {
     const log = this.log(profileId)
@@ -141,6 +187,11 @@ export class DaemonIscpService {
         change: 'added',
         reason: 'session_created',
       } satisfies SessionLifecycleNotification)
+    }
+    // Materialize the text view in the same tick so live 'text-view-event'
+    // pushes fire alongside the raw 'session-event' ones.
+    if (events.length > 0) {
+      this.textView(profileId).sync(sessionId)
     }
     return results
   }

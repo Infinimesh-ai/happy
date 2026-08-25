@@ -36,6 +36,7 @@ import {
   sanitizeSessionEnvironment,
   wrapTmuxCommandWithSessionEnvironmentSanitizer,
 } from './sessionEnvironment';
+import { startHappyTerminalDaemon } from './happyTerminalBoot';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -46,13 +47,11 @@ function appendDaemonSpawnModeArgs(args: string[], options: SpawnSessionOptions,
   if (agent !== 'claude' && agent !== 'codex') {
     return;
   }
-  // For claude, 'default' is the app's ambient "no override" value — forwarding
-  // it would pin the session to prompting mode and lose the CLI's own default
-  // (e.g. a --yolo setup where sessions must bypass permissions). For codex,
-  // 'default' IS a concrete ask-first mode (untrusted + workspace-write)
-  // distinct from the codex launch default ('yolo'), so it must be forwarded
-  // or the user's explicit ask-first pick silently yields a yolo session.
-  if (options.permissionMode && (agent === 'codex' || options.permissionMode !== 'default')) {
+  // 'default' is the app's "no override" value for every agent: it means run
+  // the harness the way it is already configured. Forwarding it would replace
+  // that configuration with one specific mode, which is the opposite of what
+  // the word promises. Each runner supplies its own launch default instead.
+  if (options.permissionMode && options.permissionMode !== 'default') {
     args.push('--permission-mode', options.permissionMode);
   }
   if (options.modelMode && options.modelMode !== 'default') {
@@ -178,6 +177,11 @@ export async function startDaemon(): Promise<void> {
   // 2. Should not have another daemon process running
 
   try {
+    // Happy Agent is a machine-level service shared by the mobile app and
+    // Happy Terminal. Start it concurrently and keep this daemon boot path
+    // independent from its install/download/network state.
+    startHappyTerminalDaemon();
+
     // Start caffeinate
     const caffeinateStarted = startCaffeinate();
     if (caffeinateStarted) {
@@ -737,10 +741,9 @@ export async function startDaemon(): Promise<void> {
         if (options?.model) {
           launch.args.push('--model', options.model);
         }
-        // Same as spawnSession: for claude, ambient 'default' must not
-        // override the CLI default; for codex, 'default' is a concrete
-        // ask-first mode and must be forwarded.
-        if (options?.permissionMode && (metadata.flavor === 'codex' || options.permissionMode !== 'default')) {
+        // Same as spawnSession: ambient 'default' must not override whatever
+        // the harness is already configured to do.
+        if (options?.permissionMode && options.permissionMode !== 'default') {
           launch.args.push('--permission-mode', options.permissionMode);
         }
 
@@ -778,11 +781,34 @@ export async function startDaemon(): Promise<void> {
           (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
 
           if (session.startedBy === 'daemon' && session.childProcess) {
-            try {
-              session.childProcess.kill('SIGTERM');
-              logger.debug(`[DAEMON RUN] Sent SIGTERM to daemon-spawned session ${sessionId}`);
-            } catch (error) {
-              logger.debug(`[DAEMON RUN] Failed to kill session ${sessionId}:`, error);
+            // Signal the whole process group, not just the Happy CLI parent.
+            // The harness runs its own backend as a grandchild — Codex spawns
+            // `codex app-server` (codexAppServerClient.ts:647) and only kills it
+            // from its own disconnect path, which a bare SIGTERM to the parent
+            // never reaches. Killing the parent alone therefore left the agent
+            // running, reparented and invisible. The daemon spawns with
+            // `detached: true` (see spawnSession above), which makes the parent
+            // a group leader, so the negative pid covers every descendant.
+            let signalled = false;
+            if (process.platform !== 'win32') {
+              try {
+                process.kill(-pid, 'SIGTERM');
+                signalled = true;
+                logger.debug(`[DAEMON RUN] Sent SIGTERM to process group of session ${sessionId}`);
+              } catch (error) {
+                logger.debug(`[DAEMON RUN] Group kill failed for session ${sessionId}, falling back:`, error);
+              }
+            }
+            // Windows has no process groups to signal, and a group kill can
+            // still fail if the child already exited or never led a group.
+            // Either way the parent is worth killing on its own.
+            if (!signalled) {
+              try {
+                session.childProcess.kill('SIGTERM');
+                logger.debug(`[DAEMON RUN] Sent SIGTERM to daemon-spawned session ${sessionId}`);
+              } catch (error) {
+                logger.debug(`[DAEMON RUN] Failed to kill session ${sessionId}:`, error);
+              }
             }
           } else {
             // For externally started sessions, try to kill by PID

@@ -80,9 +80,15 @@ function hasCodexSubagentReference(message: Record<string, unknown>): boolean {
     return false;
 }
 
-const DEFAULT_CODEX_MODEL = 'gpt-5.5';
+const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
-const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
+// Codex's app-server protocol requires a concrete approval policy and sandbox
+// on every turn, so unlike Claude there is no "send nothing" here. This is the
+// closest honest equivalent: `auto` is Codex's own shipped default preset
+// (on-request approvals inside the workspace sandbox), so leaving the picker on
+// Default lands where plain `codex` would. It used to be 'yolo', which quietly
+// gave full access to anyone who never touched the picker.
+const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'auto';
 
 /**
  * Main entry point for the codex command with ink UI
@@ -308,7 +314,7 @@ export async function runCodex(opts: {
     ];
 
     const VALID_REMOTE_EFFORTS: readonly ReasoningEffort[] = [
-        'none', 'minimal', 'low', 'medium', 'high', 'xhigh',
+        'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
     ];
 
     const handleUserMessage = createSerialAsyncHandler<UserMessage>(async (message) => {

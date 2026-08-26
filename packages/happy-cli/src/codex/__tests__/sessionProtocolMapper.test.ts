@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createId, isCuid } from '@paralleldrive/cuid2';
+import { projectPhoneTextView } from '@slopus/happy-wire';
 import {
     mapCodexMcpMessageToSessionEnvelopes,
     mapCodexProcessorMessageToSessionEnvelopes,
@@ -37,6 +38,66 @@ describe('mapCodexMcpMessageToSessionEnvelopes', () => {
             status: 'cancelled',
         });
         expect(result.currentTurnId).toBeNull();
+    });
+
+    it('projects failed task errors into phone-visible session text', () => {
+        const result = mapCodexMcpMessageToSessionEnvelopes(
+            {
+                type: 'task_complete',
+                status: 'failed',
+                error: {
+                    message: '401 Unauthorized: Missing bearer authentication',
+                },
+            },
+            { currentTurnId: 'turn-1' }
+        );
+
+        expect(result.envelopes).toHaveLength(2);
+        expect(result.envelopes[0]).toMatchObject({
+            role: 'agent',
+            turn: 'turn-1',
+            ev: {
+                t: 'text',
+                text: 'Codex error: 401 Unauthorized: Missing bearer authentication',
+            },
+        });
+        expect(result.envelopes[1]).toMatchObject({
+            role: 'agent',
+            turn: 'turn-1',
+            ev: {
+                t: 'turn-end',
+                status: 'failed',
+            },
+        });
+        expect(projectPhoneTextView({
+            role: 'session',
+            content: result.envelopes[0],
+        })).toEqual({
+            kind: 'session-text',
+            emit: {
+                role: 'agent',
+                content: {
+                    type: 'text',
+                    text: 'Codex error: 401 Unauthorized: Missing bearer authentication',
+                },
+            },
+        });
+        expect(result.currentTurnId).toBeNull();
+    });
+
+    it('projects failed abort strings into phone-visible session text', () => {
+        const result = mapCodexMcpMessageToSessionEnvelopes(
+            {
+                type: 'turn_aborted',
+                error: 'provider unavailable',
+            },
+            { currentTurnId: 'turn-1' }
+        );
+
+        expect(result.envelopes.map((envelope) => envelope.ev)).toEqual([
+            { t: 'text', text: 'Codex error: provider unavailable' },
+            { t: 'turn-end', status: 'failed' },
+        ]);
     });
 
     it('maps agent text messages with turn context', () => {

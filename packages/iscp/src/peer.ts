@@ -61,8 +61,10 @@ export interface SessionDiagnosticEvent {
   peerDeviceId: string;
   sessionId?: string;
   role?: 'initiator' | 'responder';
-  event: 'create' | 'replace' | 'tombstone' | 'reopen_sent' | 'reopen_accepted' | 'reopen_rejected' | 'reopen_coalesced';
+  event: 'create' | 'replace' | 'tombstone' | 'reopen_sent' | 'reopen_accepted' | 'reopen_rejected' | 'reopen_coalesced' | 'hello_attempt' | 'hello_superseded' | 'hello_coalesced';
   cause?: string;
+  attempt?: number;
+  pendingCount?: number;
 }
 
 interface PeerSession {
@@ -103,6 +105,8 @@ export interface IscpPeerOptions {
   wsBackoff?: Partial<RelayWsBackoff>;
   fetchImpl?: FetchLike;
   route?: Partial<Omit<EnvelopeRoute, 'relay_id'>>;
+  /** Short Relay lifetime for public Session Hello/Ready objects. */
+  handshakeTTLSeconds?: number;
   replayStoreFor?: (sessionId: string, peerDeviceId: string) => ReplayStore | undefined;
   /**
    * Called whenever access/refresh credentials rotate, so callers can persist
@@ -160,6 +164,8 @@ export class IscpPeer {
   private readonly staleSessionIds = new Map<string, Set<string>>();
   /** Short-lived authenticated reopen replay window, bounded per peer. */
   private readonly seenReopenRequestIds = new Map<string, string[]>();
+  private readonly helloAttemptCounts = new Map<string, number>();
+  private readonly pendingHelloAttempts = new Map<string, Array<{ sessionId: string; expiresAt: number }>>();
   private readonly outboundQueue: SecureEnvelope[] = [];
   private accessToken: string;
   private refreshToken: string;
@@ -213,6 +219,11 @@ export class IscpPeer {
     return this.outboundQueue.length;
   }
 
+  /** Active, TTL-bounded Hello attempts that may still exist at the Relay. */
+  pendingHelloCount(peerDeviceId: string): number {
+    return this.prunePendingHelloAttempts(peerDeviceId).length;
+  }
+
   /** Metadata-only session status for liveness supervision and diagnostics. */
   sessionStatus(peerDeviceId: string): PeerSessionStatus | undefined {
     const session = this.sessions.get(peerDeviceId);
@@ -261,6 +272,17 @@ export class IscpPeer {
   async openSession(peerDeviceId: string, opts?: { timeoutMs?: number }): Promise<unknown> {
     const existing = this.sessions.get(peerDeviceId);
     if (existing?.peerManifest !== undefined) return existing.peerManifest;
+    if (existing) {
+      this.opts.onSessionDiagnostic?.({
+        peerDeviceId,
+        sessionId: existing.sessionId,
+        role: existing.role,
+        event: 'hello_coalesced',
+        cause: 'open_session_single_flight',
+        attempt: this.helloAttemptCounts.get(peerDeviceId) ?? 0,
+        pendingCount: this.pendingHelloCount(peerDeviceId),
+      });
+    }
     let session = existing;
     if (!session) {
       const peerIdentity = await this.opts.resolvePeerIdentity(peerDeviceId);
@@ -281,6 +303,34 @@ export class IscpPeer {
         readyWaiters: [],
       };
       this.sessions.set(peerDeviceId, session);
+      const activeAttempts = this.prunePendingHelloAttempts(peerDeviceId);
+      if (activeAttempts.length > 0) {
+        this.opts.onSessionDiagnostic?.({
+          peerDeviceId,
+          sessionId,
+          role: 'initiator',
+          event: 'hello_superseded',
+          cause: 'newer_session_attempt',
+          attempt: this.helloAttemptCounts.get(peerDeviceId) ?? 0,
+          pendingCount: activeAttempts.length,
+        });
+      }
+      const attempt = (this.helloAttemptCounts.get(peerDeviceId) ?? 0) + 1;
+      this.helloAttemptCounts.set(peerDeviceId, attempt);
+      activeAttempts.push({
+        sessionId,
+        expiresAt: this.now().getTime() + this.handshakeTTLSeconds() * 1_000,
+      });
+      this.pendingHelloAttempts.set(peerDeviceId, activeAttempts);
+      this.opts.onSessionDiagnostic?.({
+        peerDeviceId,
+        sessionId,
+        role: 'initiator',
+        event: 'hello_attempt',
+        cause: 'open_session',
+        attempt,
+        pendingCount: activeAttempts.length,
+      });
       this.opts.onSessionDiagnostic?.({
         peerDeviceId,
         sessionId,
@@ -419,6 +469,7 @@ export class IscpPeer {
     session.lastAuthenticatedAt = this.now().getTime();
     if (envelope.payload_type === this.manifestPayloadType) {
       session.peerManifest = JSON.parse(utf8Decode(plaintext));
+      this.pendingHelloAttempts.delete(session.peerDeviceId);
       this.opts.onPeerReady?.(session.peerDeviceId, session.peerManifest);
       for (const waiter of session.readyWaiters.splice(0)) waiter.resolve(session.peerManifest);
       return;
@@ -654,6 +705,20 @@ export class IscpPeer {
     };
   }
 
+  private handshakeTTLSeconds(): number {
+    return this.opts.handshakeTTLSeconds
+      ?? Math.min(this.opts.route?.ttl_seconds ?? 600, 75);
+  }
+
+  private prunePendingHelloAttempts(peerDeviceId: string): Array<{ sessionId: string; expiresAt: number }> {
+    const now = this.now().getTime();
+    const active = (this.pendingHelloAttempts.get(peerDeviceId) ?? [])
+      .filter((attempt) => attempt.expiresAt > now);
+    if (active.length === 0) this.pendingHelloAttempts.delete(peerDeviceId);
+    else this.pendingHelloAttempts.set(peerDeviceId, active);
+    return active;
+  }
+
   private async submitHandshake(peerDeviceId: string, sessionId: string, payloadType: string, object: unknown): Promise<void> {
     const envelope: SecureEnvelope = {
       type: SECURE_ENVELOPE_TYPE,
@@ -665,7 +730,7 @@ export class IscpPeer {
       sequence: 0,
       nonce: toBase64Url(this.provider.randomBytes(12)),
       payload_type: payloadType,
-      route: this.route(),
+      route: this.route(this.handshakeTTLSeconds()),
       ciphertext: toBase64Url(utf8Encode(JSON.stringify(object))),
     };
     await this.submitOrQueue(envelope);

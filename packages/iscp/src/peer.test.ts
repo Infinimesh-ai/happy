@@ -47,7 +47,7 @@ interface TestPeer {
   received: Array<{ from: string; payloadType: string; text: string }>;
   errors: unknown[];
   manifests: Array<{ from: string; manifest: unknown }>;
-  sessionDiagnostics: Array<{ event: string; cause?: string }>;
+  sessionDiagnostics: Array<{ event: string; cause?: string; attempt?: number; pendingCount?: number }>;
 }
 
 function createTestPeer(
@@ -60,6 +60,7 @@ function createTestPeer(
     grantAudience?: string;
     onSessionReopen?: (cause: string) => void;
     now?: () => Date;
+    handshakeTTLSeconds?: number;
   },
 ): TestPeer {
   const device = opts?.device ?? createDevice(provider, { domainId: relay.domainId, deviceId });
@@ -97,10 +98,15 @@ function createTestPeer(
     onSessionDiagnostic: (event) => result.sessionDiagnostics.push({
       event: event.event,
       ...(event.cause !== undefined ? { cause: event.cause } : {}),
+      ...(event.attempt !== undefined ? { attempt: event.attempt } : {}),
+      ...(event.pendingCount !== undefined ? { pendingCount: event.pendingCount } : {}),
     }),
     onError: (error) => {
       result.errors.push(error);
     },
+    ...(opts?.handshakeTTLSeconds !== undefined
+      ? { handshakeTTLSeconds: opts.handshakeTTLSeconds }
+      : {}),
     ...(opts?.now !== undefined ? { now: opts.now } : {}),
   });
   return result;
@@ -442,6 +448,56 @@ describe('IscpPeer over an in-memory relay', () => {
     const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
     const alpha = createTestPeer(relay, 'device-alpha', identities, issuer);
     expect(() => alpha.peer.closeSession('device-never-seen')).not.toThrow();
+  });
+
+  it('bounds offline initial Hellos with short TTL and exposes lifecycle metrics', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const alpha = createTestPeer(relay, 'device-alpha', identities, issuer, { handshakeTTLSeconds: 35 });
+    createTestPeer(relay, 'device-beta', identities, issuer); // identity only; phone remains offline
+    alpha.peer.start();
+    try {
+      await waitFor(() => alpha.peer.connectionState === 'READY', 5000, 'alpha READY');
+      const first = alpha.peer.openSession('device-beta', { timeoutMs: 60_000 });
+      first.catch(() => { });
+      await waitFor(
+        () => relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE).length === 1,
+        5000,
+        'first short-lived hello',
+      );
+
+      const coalesced = alpha.peer.openSession('device-beta', { timeoutMs: 60_000 });
+      coalesced.catch(() => { });
+      await waitFor(
+        () => alpha.sessionDiagnostics.some((event) => event.event === 'hello_coalesced'),
+        5000,
+        'coalesced metric',
+      );
+      alpha.peer.closeSession('device-beta');
+      await expect(first).rejects.toMatchObject({ retryable: true });
+      await expect(coalesced).rejects.toMatchObject({ retryable: true });
+
+      const second = alpha.peer.openSession('device-beta', { timeoutMs: 60_000 });
+      second.catch(() => { });
+      await waitFor(
+        () => relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE).length === 2,
+        5000,
+        'replacement short-lived hello',
+      );
+      const hellos = relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE);
+      expect(hellos.every((hello) => hello.route.ttl_seconds === 35)).toBe(true);
+      expect(alpha.sessionDiagnostics.some((event) => event.event === 'hello_attempt')).toBe(true);
+      expect(alpha.sessionDiagnostics.some((event) => event.event === 'hello_superseded')).toBe(true);
+      expect(alpha.sessionDiagnostics
+        .filter((event) => event.event === 'hello_attempt')
+        .at(-1)).toMatchObject({ attempt: 2, pendingCount: 2 });
+      expect(alpha.peer.pendingHelloCount('device-beta')).toBeLessThanOrEqual(2);
+      alpha.peer.closeSession('device-beta');
+      await expect(second).rejects.toMatchObject({ retryable: true });
+    } finally {
+      alpha.peer.stop();
+    }
   });
 
   it('converges on one session when a peer drains competing hellos from before and after closeSession', async () => {

@@ -146,6 +146,9 @@ async function startProfilePeer(
   const subscribedPeers = new Set<string>()
   let requestSessionReopen: ((cause: string) => boolean) | undefined
   let sessionReopenCoalesceCount = 0
+  let helloAttemptCount = 0
+  let helloSupersededCount = 0
+  let helloCoalescedCount = 0
 
   const peer: IscpPeer = new IscpPeer({
     device,
@@ -159,6 +162,10 @@ async function startProfilePeer(
     // silent socket is dead after seconds, not the generic 60s default —
     // keep the daemon reachable across app reconnects.
     wsBackoff: { idleTimeoutMs: 15_000 },
+    // The control phone may be offline while this daemon remains healthy.
+    // Keep public handshakes short-lived so Relay drain cannot replay minutes
+    // of obsolete initial attempts when the phone returns.
+    handshakeTTLSeconds: 35,
     resolvePeerIdentity: async (deviceId) => {
       const record = await trustRoot.deviceStatus(deviceId)
       const status = record.status.toLowerCase()
@@ -222,7 +229,15 @@ async function startProfilePeer(
     },
     onSessionDiagnostic: (event) => {
       if (event.event === 'reopen_coalesced') sessionReopenCoalesceCount += 1
-      logger.debug('[ISCP PEER] Session lifecycle', { profileId, ...event })
+      if (event.event === 'hello_attempt') helloAttemptCount += 1
+      if (event.event === 'hello_superseded') helloSupersededCount += 1
+      if (event.event === 'hello_coalesced') helloCoalescedCount += 1
+      const { pendingCount, ...metadata } = event
+      logger.debug('[ISCP PEER] Session lifecycle', {
+        profileId,
+        ...metadata,
+        ...(pendingCount !== undefined ? { pending_count: pendingCount } : {}),
+      })
     },
     onPayload: (peerDeviceId, payloadType, plaintext) => {
       if (payloadType !== WIRE_REQUEST_PAYLOAD_TYPE) return
@@ -360,6 +375,9 @@ async function startProfilePeer(
     // Managed profiles rotate only from the authenticated phone control
     // signal (or the local control endpoint), never from idle time alone.
     superviseReopen: true,
+    // Paired with the 35-second Hello TTL: at most the current and boundary
+    // attempt can still be valid at the Relay, with <=30s reconnect latency.
+    timeoutMs: 30_000,
     sessionStatus: () => {
       const current = peer.sessionStatus(audience)
       if (!current) return undefined
@@ -406,6 +424,10 @@ async function startProfilePeer(
         sessionAttempt,
         sessionReopenCount,
         sessionReopenCoalesceCount,
+        helloAttemptCount,
+        helloSupersededCount,
+        helloCoalescedCount,
+        pendingCount: peer.pendingHelloCount(audience),
       }
     },
     reopen: () => initiator.requestReopen('controlled_reopen'),

@@ -27,6 +27,10 @@ const ProfilePeerStatusSchema = z.object({
   sessionAttempt: z.number(),
   sessionReopenCount: z.number(),
   sessionReopenCoalesceCount: z.number(),
+  helloAttemptCount: z.number(),
+  helloSupersededCount: z.number(),
+  helloCoalescedCount: z.number(),
+  pendingCount: z.number(),
   sessionLastVerifiedAt: z.number().optional(),
 });
 

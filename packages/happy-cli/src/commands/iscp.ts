@@ -527,6 +527,7 @@ async function printCheckLayers(
   if (peer.sessionId !== undefined) {
     console.log(`      id ${peer.sessionId}; role ${peer.sessionRole ?? 'unknown'}; attempts ${peer.sessionAttempt}; reopens ${peer.sessionReopenCount}; coalesced ${peer.sessionReopenCoalesceCount}`)
   }
+  console.log(`      hello attempts ${peer.helloAttemptCount}; superseded ${peer.helloSupersededCount}; coalesced ${peer.helloCoalescedCount}; pending ${peer.pendingCount}`)
   if (peer.session === 'authorization_expired') {
     console.log(`      the grant has expired — run: happy iscp renew <renewal-id>`)
   }

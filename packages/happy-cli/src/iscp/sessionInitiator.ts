@@ -41,6 +41,10 @@ export interface ProfilePeerStatus {
   sessionAttempt: number
   sessionReopenCount: number
   sessionReopenCoalesceCount: number
+  helloAttemptCount: number
+  helloSupersededCount: number
+  helloCoalescedCount: number
+  pendingCount: number
   sessionLastVerifiedAt?: number
 }
 

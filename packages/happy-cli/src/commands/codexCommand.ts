@@ -1,9 +1,8 @@
-import { authAndSetupMachineIfNeeded } from '@/ui/auth'
 import { runCodex } from '@/codex/runCodex'
 import { extractCodexResumeFlag } from '@/codex/cliArgs'
 import { extractNoSandboxFlag } from '@/utils/sandboxFlags'
 import { ensureDaemonRunning } from '@/daemon/ensureDaemonRunning'
-import { ensureIscpProfileEnv } from '@/iscp/profileEnv'
+import { resolveSessionNetwork } from '@/iscp/networkStartup'
 import type { PermissionMode } from '@/api/types'
 import type { ReasoningEffort } from '@/codex/codexAppServerTypes'
 
@@ -29,15 +28,15 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
     }
   }
 
-  // Fail fast before spawning: a terminal launch without a resolved ISCP
-  // profile would be listed by the daemon yet unreachable from the app.
-  ensureIscpProfileEnv('happy codex', startedBy)
-
-  const { credentials } = await authAndSetupMachineIfNeeded()
+  // Network mode decision (OPS 2026-08-26 §3.1): legacy credentials keep the
+  // existing auth path verbatim; a healthy ISCP profile alone runs ISCP-only.
+  // Also fails fast before spawning: a terminal launch without a resolved
+  // ISCP profile would be listed by the daemon yet unreachable from the app.
+  const network = await resolveSessionNetwork('happy codex', startedBy)
   await ensureDaemonRunning()
 
   await runCodex({
-    credentials,
+    network,
     startedBy,
     noSandbox: sandboxArgs.noSandbox,
     resumeThreadId: codexArgs.resumeThreadId ?? undefined,

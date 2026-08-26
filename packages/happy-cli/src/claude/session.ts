@@ -8,7 +8,8 @@ import type { SandboxConfig } from "@/persistence";
 export class Session {
     readonly path: string;
     readonly logPath: string;
-    readonly api: ApiClient;
+    /** null on ISCP-only sessions — legacy-server extras (push) are skipped. */
+    readonly api: ApiClient | null;
     readonly client: ApiSessionClient;
     readonly queue: MessageQueue2<EnhancedMode>;
     readonly claudeEnvVars?: Record<string, string>;
@@ -34,7 +35,7 @@ export class Session {
     private keepAliveInterval: NodeJS.Timeout;
 
     constructor(opts: {
-        api: ApiClient,
+        api: ApiClient | null,
         client: ApiSessionClient,
         path: string,
         logPath: string,

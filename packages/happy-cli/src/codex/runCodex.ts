@@ -9,7 +9,9 @@ import { DiffProcessor } from './utils/diffProcessor';
 import { randomUUID } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { logger } from '@/ui/logger';
-import { Credentials, readSettings } from '@/persistence';
+import { readSettings } from '@/persistence';
+import type { SessionNetwork } from '@/iscp/networkStartup';
+import { createIscpOnlySession } from '@/iscp/iscpOnlySession';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
@@ -28,7 +30,7 @@ import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler"
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { PermissionMode } from '@/api/types';
-import type { ApiSessionClient } from '@/api/apiSession';
+import { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy, shouldAutoApproveCodexApproval } from './executionPolicy';
 import {
     mapCodexMcpMessageToSessionEnvelopes,
@@ -94,7 +96,7 @@ const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'auto';
  * Main entry point for the codex command with ink UI
  */
 export async function runCodex(opts: {
-    credentials: Credentials;
+    network: SessionNetwork;
     startedBy?: 'daemon' | 'terminal';
     noSandbox?: boolean;
     resumeThreadId?: string;
@@ -128,7 +130,11 @@ export async function runCodex(opts: {
     // Set backend for offline warnings (before any API calls)
     connectionState.setBackend('Codex');
 
-    const api = await ApiClient.create(opts.credentials);
+    // ISCP-only sessions (OPS 2026-08-26 §4.1) never construct a Happy
+    // Server client — no auth, no machine row, no session socket.
+    const api: ApiClient | null = opts.network.mode === 'legacy'
+        ? await ApiClient.create(opts.network.credentials)
+        : null;
 
     // Log startup options
     logger.debug(`[codex] Starting with options: startedBy=${opts.startedBy || 'terminal'}`);
@@ -145,10 +151,12 @@ export async function runCodex(opts: {
         process.exit(1);
     }
     logger.debug(`Using machineId: ${machineId}`);
-    await api.getOrCreateMachine({
-        machineId,
-        metadata: initialMachineMetadata
-    });
+    if (api) {
+        await api.getOrCreateMachine({
+            machineId,
+            metadata: initialMachineMetadata
+        });
+    }
 
     //
     // Create session
@@ -198,8 +206,13 @@ export async function runCodex(opts: {
             agentState: state,
             agentStateVersion: parseInt(reconnectAgentStateVersion || '0', 10),
         };
-    } else {
+    } else if (api) {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+    } else {
+        // ISCP-only: the session identity is minted locally — the daemon event
+        // log and RPC registry treat ids as opaque, and there is no server row.
+        response = createIscpOnlySession(metadata, state);
+        logger.debug(`[START] Minted ISCP-only session ${response.id}`);
     }
 
     // Handle server unreachable case - create offline stub with hot reconnection
@@ -210,21 +223,30 @@ export async function runCodex(opts: {
     let client!: CodexAppServerClient;
     let reasoningProcessor!: ReasoningProcessor;
     let abortInProgress: Promise<void> | null = null;
-    const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
-        api,
-        sessionTag,
-        metadata,
-        state,
-        response,
-        onSessionSwap: (newSession) => {
-            session = newSession;
-            // Update permission handler with new session to avoid stale reference
-            if (permissionHandler) {
-                permissionHandler.updateSession(newSession);
+    let reconnectionHandle: ReturnType<typeof setupOfflineReconnection>['reconnectionHandle'] = null;
+    if (api) {
+        const offlineSetup = setupOfflineReconnection({
+            api,
+            sessionTag,
+            metadata,
+            state,
+            response,
+            onSessionSwap: (newSession) => {
+                session = newSession;
+                // Update permission handler with new session to avoid stale reference
+                if (permissionHandler) {
+                    permissionHandler.updateSession(newSession);
+                }
             }
-        }
-    });
-    session = initialSession;
+        });
+        session = offlineSetup.session;
+        reconnectionHandle = offlineSetup.reconnectionHandle;
+    } else {
+        // ISCP-only: no Happy Server socket/outbox — history goes to the
+        // daemon event log, inbound RPC over the localhost bridge. There is
+        // no "offline" state to reconnect from.
+        session = new ApiSessionClient(null, response!);
+    }
 
     // On reconnect, un-archive the session and skip replaying old messages.
     if (reconnectSessionId) {
@@ -415,7 +437,7 @@ export async function runCodex(opts: {
     const sendReady = () => {
         session.sendSessionEvent({ type: 'ready' });
         try {
-            api.push().sendSessionNotification({
+            api?.push().sendSessionNotification({
                 kind: 'done',
                 metadata: session.getMetadata(),
                 data: {

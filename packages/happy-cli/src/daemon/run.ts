@@ -8,7 +8,7 @@ import { TrackedSession, SessionEncryptionData } from './types';
 import { MachineMetadata, DaemonState, Metadata } from '@/api/types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 import { logger } from '@/ui/logger';
-import { authAndSetupMachineIfNeeded } from '@/ui/auth';
+import { resolveDaemonNetwork } from '@/iscp/networkStartup';
 import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
@@ -188,9 +188,15 @@ export async function startDaemon(): Promise<void> {
       logger.debug('[DAEMON RUN] Sleep prevention enabled');
     }
 
-    // Ensure auth and machine registration BEFORE anything else
-    const { credentials, machineId } = await authAndSetupMachineIfNeeded();
-    logger.debug('[DAEMON RUN] Auth and machine setup complete');
+    // Network mode decision BEFORE anything else (OPS 2026-08-26 §4.1):
+    // legacy credentials → existing auth/machine setup verbatim; a healthy
+    // ISCP profile alone → ISCP-only boot with no legacy auth, machine
+    // registration, or Happy Server socket. Zero usable credentials → hard
+    // error (the daemon is headless and must never prompt).
+    const network = await resolveDaemonNetwork();
+    const machineId = network.machineId;
+    const legacyCredentials = network.mode === 'legacy' ? network.credentials : null;
+    logger.debug(`[DAEMON RUN] Network mode resolved: ${network.mode}`);
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
@@ -278,6 +284,15 @@ export async function startDaemon(): Promise<void> {
         };
         pidToTrackedSession.set(pid, trackedSession);
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
+      } else {
+        // Externally-started session re-reporting itself. ISCP-only sessions
+        // re-post this webhook on every metadata/agent-state change (their
+        // only state channel), so the tracked metadata must follow.
+        existingSession.happySessionMetadataFromLocalWebhook = sessionMetadata;
+        if (encryption) {
+          existingSession.encryption = encryption;
+        }
+        logger.debug(`[DAEMON RUN] Updated externally-started session ${sessionId} from webhook`);
       }
     };
 
@@ -690,9 +705,14 @@ export async function startDaemon(): Promise<void> {
     };
 
     const fetchServerSessionMetadata = async (sessionId: string, encryptionKey: Uint8Array, encryptionVariant: 'legacy' | 'dataKey'): Promise<Metadata | null> => {
+      if (!legacyCredentials) {
+        // ISCP-only: there is no server-side session directory to refresh
+        // from; resume falls back to the webhook-propagated metadata.
+        return null;
+      }
       try {
         const response = await axios.get(`${configuration.serverUrl}/v1/sessions`, {
-          headers: { Authorization: `Bearer ${credentials.token}` },
+          headers: { Authorization: `Bearer ${legacyCredentials.token}` },
           timeout: 10_000,
         });
         const sessions = (response.data as { sessions: { id: string; metadata: string }[] }).sessions;
@@ -920,38 +940,47 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Bundle at ${bundlePath} not found; self-restart on upgrade disabled`);
     }
 
-    // Prepare initial daemon state
-    const initialDaemonState: DaemonState = {
-      status: 'offline',
-      pid: process.pid,
-      httpPort: controlPort,
-      startedAt: Date.now()
-    };
+    // Legacy machine registration + realtime socket — only with legacy
+    // credentials. ISCP-only daemons are reachable exclusively through the
+    // relay peers (wire machine.rpc bridges spawn/stop) and must not touch
+    // Happy Server auth, machine, or Socket.IO endpoints.
+    let apiMachine: ReturnType<ApiClient['machineSyncClient']> | null = null;
+    if (legacyCredentials) {
+      // Prepare initial daemon state
+      const initialDaemonState: DaemonState = {
+        status: 'offline',
+        pid: process.pid,
+        httpPort: controlPort,
+        startedAt: Date.now()
+      };
 
-    // Create API client
-    const api = await ApiClient.create(credentials);
+      // Create API client
+      const api = await ApiClient.create(legacyCredentials);
 
-    // Get or create machine
-    const machine = await api.getOrCreateMachine({
-      machineId,
-      metadata: initialMachineMetadata,
-      daemonState: initialDaemonState
-    });
-    logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
+      // Get or create machine
+      const machine = await api.getOrCreateMachine({
+        machineId,
+        metadata: initialMachineMetadata,
+        daemonState: initialDaemonState
+      });
+      logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
 
-    // Create realtime machine session
-    const apiMachine = api.machineSyncClient(machine);
+      // Create realtime machine session
+      apiMachine = api.machineSyncClient(machine);
 
-    // Set RPC handlers
-    apiMachine.setRPCHandlers({
-      spawnSession,
-      resumeSession,
-      stopSession,
-      requestShutdown: () => requestShutdown('happy-app')
-    });
+      // Set RPC handlers
+      apiMachine.setRPCHandlers({
+        spawnSession,
+        resumeSession,
+        stopSession,
+        requestShutdown: () => requestShutdown('happy-app')
+      });
 
-    // Connect to server
-    apiMachine.connect();
+      // Connect to server
+      apiMachine.connect();
+    } else {
+      logger.debug('[DAEMON RUN] ISCP-only: skipping legacy machine registration and Happy Server socket');
+    }
 
     // Every 60 seconds:
     // 1. Prune stale sessions
@@ -1011,7 +1040,7 @@ export async function startDaemon(): Promise<void> {
         // leaving nothing running once we also exit.
         autoRenewal.stop();
         iscpPeers.stop();
-        apiMachine.shutdown();
+        apiMachine?.shutdown();
         await stopControlServer();
         await cleanupDaemonState();
         await releaseDaemonLock(daemonLockHandle);
@@ -1069,20 +1098,22 @@ export async function startDaemon(): Promise<void> {
         logger.debug('[DAEMON RUN] Health check interval cleared');
       }
 
-      // Update daemon state before shutting down
-      await apiMachine.updateDaemonState((state: DaemonState | null) => ({
-        ...state,
-        status: 'shutting-down',
-        shutdownRequestedAt: Date.now(),
-        shutdownSource: source
-      }));
+      // Update daemon state before shutting down (legacy socket only)
+      if (apiMachine) {
+        await apiMachine.updateDaemonState((state: DaemonState | null) => ({
+          ...state,
+          status: 'shutting-down',
+          shutdownRequestedAt: Date.now(),
+          shutdownSource: source
+        }));
 
-      // Give time for metadata update to send
-      await new Promise(resolve => setTimeout(resolve, 100));
+        // Give time for metadata update to send
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
 
       autoRenewal.stop();
       iscpPeers.stop();
-      apiMachine.shutdown();
+      apiMachine?.shutdown();
       await stopControlServer();
       await cleanupDaemonState();
       await stopCaffeinate();
@@ -1099,6 +1130,7 @@ export async function startDaemon(): Promise<void> {
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
+    console.error('Daemon startup failed:', error instanceof Error ? error.message : error);
     process.exit(1);
   }
 }

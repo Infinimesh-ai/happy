@@ -356,6 +356,8 @@ Conversation history is preserved on the server, but in-flight tool calls are in
         }
       }
       
+      const { ensureLegacyOnlyAgentUsable } = await import('@/iscp/networkStartup');
+      await ensureLegacyOnlyAgentUsable('happy gemini');
       const {
         credentials
       } = await authAndSetupMachineIfNeeded();
@@ -394,6 +396,8 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       }
 
       const resolved = resolveAcpAgentConfig(acpArgs);
+      const { ensureLegacyOnlyAgentUsable } = await import('@/iscp/networkStartup');
+      await ensureLegacyOnlyAgentUsable('happy acp');
       const { credentials } = await authAndSetupMachineIfNeeded();
       await ensureDaemonRunning()
 
@@ -436,6 +440,8 @@ Conversation history is preserved on the server, but in-flight tool calls are in
         }
       }
 
+      const { ensureLegacyOnlyAgentUsable } = await import('@/iscp/networkStartup');
+      await ensureLegacyOnlyAgentUsable('happy openclaw');
       const { credentials } = await authAndSetupMachineIfNeeded();
       await ensureDaemonRunning()
 
@@ -469,6 +475,8 @@ Conversation history is preserved on the server, but in-flight tool calls are in
         }
       }
 
+      const { ensureLegacyOnlyAgentUsable } = await import('@/iscp/networkStartup');
+      await ensureLegacyOnlyAgentUsable('happy agy');
       const { credentials } = await authAndSetupMachineIfNeeded();
       await ensureDaemonRunning()
 
@@ -802,24 +810,25 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
       options.claudeArgs = [...(options.claudeArgs || []), '--chrome']
     }
 
-    // Normal flow - auth and machine setup
+    // Normal flow — network mode decision (OPS 2026-08-26 §3.1): legacy
+    // credentials keep the existing auth path verbatim; a healthy ISCP
+    // profile alone runs ISCP-only without any legacy login; zero credentials
+    // lands in mode-selection guidance, never a silent QR prompt. Also fails
+    // fast before spawning: a terminal launch without a resolved ISCP profile
+    // would be listed by the daemon yet unreachable from the app.
+    let network: import('@/iscp/networkStartup').SessionNetwork;
     try {
-      // Fail fast before spawning: a terminal launch without a resolved ISCP
-      // profile would be listed by the daemon yet unreachable from the app.
-      const { ensureIscpProfileEnv } = await import('@/iscp/profileEnv');
-      ensureIscpProfileEnv('happy', options.startedBy);
+      const { resolveSessionNetwork } = await import('@/iscp/networkStartup');
+      network = await resolveSessionNetwork('happy', options.startedBy);
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
       process.exit(1)
     }
-    const {
-      credentials
-    } = await authAndSetupMachineIfNeeded();
     await ensureDaemonRunning()
 
     // Start the CLI
     try {
-      await runClaude(credentials, options);
+      await runClaude(network, options);
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
       if (process.env.DEBUG) {

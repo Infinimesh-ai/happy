@@ -160,7 +160,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 continue;
             }
             notifiedQuestionToolCalls.add(toolCallId);
-            session.api.push().sendSessionNotification({
+            session.api?.push().sendSessionNotification({
                 kind: 'question',
                 metadata: session.client.getMetadata(),
                 data: {
@@ -430,7 +430,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     onReady: () => {
                         session.client.closeClaudeSessionTurn('completed');
                         if (!pending && session.queue.size() === 0) {
-                            session.api.push().sendSessionNotification({
+                            session.api?.push().sendSessionNotification({
                                 kind: 'done',
                                 metadata: session.client.getMetadata(),
                                 data: {

@@ -303,6 +303,29 @@ export async function withProfileLock<T>(profileId: string, fn: () => Promise<T>
 // ---------------------------------------------------------------------------
 
 /**
+ * Stable error code for the retired Cloud `pair_…` manual pairing codes
+ * (the early `/v1 pairing-tickets` + `register-with-ticket{pairing_code}`
+ * contract). Happy only consumes Trust-Root-signed `iscp.pairing_ticket.v2`
+ * payloads (bare or wrapper); the old codes are not merely mis-encoded, they
+ * belong to a different protocol, so they get a dedicated error instead of
+ * the generic "invalid enrollment payload encoding".
+ */
+export const LEGACY_PAIRING_CODE_ERROR_CODE = 'legacy_pairing_code_unsupported'
+
+export class LegacyPairingCodeError extends Error {
+  readonly code = LEGACY_PAIRING_CODE_ERROR_CODE
+  constructor() {
+    super(
+      `${LEGACY_PAIRING_CODE_ERROR_CODE}: 'pair_…' codes come from the retired Cloud manual pairing flow ` +
+      `and cannot enroll this device. Ask the inviter for a signed enrollment invitation ` +
+      `(iscp.pairing_ticket.v2 ticket or wrapper) — in Cloud Console / JingSi, create a new ` +
+      `managed invitation and pass its payload to 'happy iscp enroll'. The old code was NOT consumed.`,
+    )
+    this.name = 'LegacyPairingCodeError'
+  }
+}
+
+/**
  * Parse an enrollment input: a path to a JSON file, raw JSON, or the
  * base64url transport string — each either a bare signed ticket or the
  * Console/JingSi `iscp_enrollment_wrapper`.
@@ -311,7 +334,11 @@ export function parseEnrollmentInput(input: string): EnrollmentTransportPayload 
   if (existsSync(input)) {
     return enrollmentPayloadFromObject(JSON.parse(readFileSync(input, 'utf8')))
   }
-  if (input.trimStart().startsWith('{')) {
+  const trimmed = input.trim()
+  if (trimmed.startsWith('pair_')) {
+    throw new LegacyPairingCodeError()
+  }
+  if (trimmed.startsWith('{')) {
     return enrollmentPayloadFromObject(JSON.parse(input))
   }
   return decodeEnrollmentFromTransport(input)

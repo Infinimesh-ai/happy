@@ -165,8 +165,9 @@ async function startRemoteRunClaudeHarness(opts: {
     mockLoop.mockReturnValue(loopDeferred.promise);
 
     const runPromise = runClaude({
-        token: 'token',
-        encryption: { type: 'legacy', secret: new Uint8Array(32) },
+        mode: 'legacy',
+        credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+        machineId: 'machine-test',
     } as any, {
         startingMode: 'remote',
         shouldStartDaemon: false,
@@ -328,8 +329,9 @@ describe('runClaude remote JSONL scanner', () => {
         mockLoop.mockReturnValue(loopDeferred.promise);
 
         const runPromise = runClaude({
-            token: 'token',
-            encryption: { type: 'legacy', secret: new Uint8Array(32) },
+            mode: 'legacy',
+            credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+            machineId: 'machine-test',
         } as any, {
             startingMode: 'local',
             shouldStartDaemon: false,
@@ -437,8 +439,9 @@ describe('runClaude remote JSONL scanner', () => {
         mockLoop.mockReturnValue(loopDeferred.promise);
 
         const runPromise = runClaude({
-            token: 'token',
-            encryption: { type: 'legacy', secret: new Uint8Array(32) },
+            mode: 'legacy',
+            credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+            machineId: 'machine-test',
         } as any, {
             startingMode: 'remote',
             shouldStartDaemon: false,

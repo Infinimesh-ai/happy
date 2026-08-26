@@ -36,7 +36,8 @@ interface LoopOptions {
     onModeChange: (mode: 'local' | 'remote') => void
     mcpServers: Record<string, any>
     session: ApiSessionClient
-    api: ApiClient,
+    /** null on ISCP-only sessions — legacy-server extras (push) are skipped. */
+    api: ApiClient | null,
     claudeEnvVars?: Record<string, string>
     claudeArgs?: string[]
     messageQueue: MessageQueue2<EnhancedMode>

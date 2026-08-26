@@ -48,6 +48,17 @@ Provisioning Bundle 经安全通道下发        │ bundle_sent
 | App | `@slopus/iscp` 暴露 enrollment API；设置页"通过 ISCP 连接"入口：QR 扫码/粘贴 ticket → OOB 码确认 → 建 profile | SDK: 2，UI: 3 |
 | SDK | `packages/iscp/src/provisioning/`（pairingTicket / localSecureChannel / bundle） | 2 |
 
+## 3.1 旧 `pair_…` 人工配对码：Happy 已弃用（OPS 2026-08-26 §3.4）
+
+Cloud 早期 `/v1 pairing-tickets` + `register-with-ticket{pairing_code}` 的 `pair_…`
+人工注册码不是 Happy enrollment 输入。`happy iscp enroll` 收到 `pair_` 前缀时抛出
+稳定错误码 **`legacy_pairing_code_unsupported`**（`src/iscp/enrollment.ts`
+`LegacyPairingCodeError`），附迁移提示（向 Console/JingSi 索取签名的
+`iscp.pairing_ticket.v2` ticket 或 wrapper），且**不消费旧码**、不把原码回显进错误
+文案。通用 base64 解码错误（`invalid enrollment payload encoding`）保留给真正的
+编码损坏输入。Cloud 侧的旧码 deprecated 标记、指标与分期下线见 OPS 交接 §3.4，
+Happy 不参与旧协议兼容。
+
 ## 4. 失败与安全语义
 
 - ticket 过期/已消费 → Trust Root 拒绝，Happy 报 `unauthorized`，不留任何状态；

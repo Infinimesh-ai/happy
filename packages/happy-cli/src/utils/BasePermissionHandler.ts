@@ -76,48 +76,54 @@ export abstract class BasePermissionHandler {
         this.session.rpcHandlerManager.registerHandler<PermissionResponse, void>(
             'permission',
             async (response) => {
-                const pending = this.pendingRequests.get(response.id);
-                if (!pending) {
-                    logger.debug(`${this.getLogPrefix()} Permission request not found or already resolved`);
-                    return;
-                }
-
-                // Remove from pending
-                this.pendingRequests.delete(response.id);
-
-                // Resolve the permission request
-                const result: PermissionResult = response.approved
-                    ? { decision: response.decision === 'approved_for_session' ? 'approved_for_session' : 'approved' }
-                    : { decision: response.decision === 'denied' ? 'denied' : 'abort' };
-
-                pending.resolve(result);
-
-                // Move request to completed in agent state
-                this.session.updateAgentState((currentState) => {
-                    const request = currentState.requests?.[response.id];
-                    if (!request) return currentState;
-
-                    const { [response.id]: _, ...remainingRequests } = currentState.requests || {};
-
-                    let res = {
-                        ...currentState,
-                        requests: remainingRequests,
-                        completedRequests: {
-                            ...currentState.completedRequests,
-                            [response.id]: {
-                                ...request,
-                                completedAt: Date.now(),
-                                status: response.approved ? 'approved' : 'denied',
-                                decision: result.decision
-                            }
-                        }
-                    } satisfies AgentState;
-                    return res;
-                });
-
-                logger.debug(`${this.getLogPrefix()} Permission ${response.approved ? 'approved' : 'denied'} for ${pending.toolName}`);
+                this.resolvePermissionResponse(response);
             }
         );
+    }
+
+    /**
+     * Resolve a pending permission through the same path used by the app RPC.
+     * Subclasses may use this for an explicitly authenticated alternate UI,
+     * such as slash-command approval in an ISCP text-only session.
+     */
+    protected resolvePermissionResponse(response: PermissionResponse): boolean {
+        const pending = this.pendingRequests.get(response.id);
+        if (!pending) {
+            logger.debug(`${this.getLogPrefix()} Permission request not found or already resolved`);
+            return false;
+        }
+
+        this.pendingRequests.delete(response.id);
+
+        const result: PermissionResult = response.approved
+            ? { decision: response.decision === 'approved_for_session' ? 'approved_for_session' : 'approved' }
+            : { decision: response.decision === 'denied' ? 'denied' : 'abort' };
+
+        pending.resolve(result);
+
+        this.session.updateAgentState((currentState) => {
+            const request = currentState.requests?.[response.id];
+            if (!request) return currentState;
+
+            const { [response.id]: _, ...remainingRequests } = currentState.requests || {};
+
+            return {
+                ...currentState,
+                requests: remainingRequests,
+                completedRequests: {
+                    ...currentState.completedRequests,
+                    [response.id]: {
+                        ...request,
+                        completedAt: Date.now(),
+                        status: response.approved ? 'approved' : 'denied',
+                        decision: result.decision
+                    }
+                }
+            } satisfies AgentState;
+        });
+
+        logger.debug(`${this.getLogPrefix()} Permission ${response.approved ? 'approved' : 'denied'} for ${pending.toolName}`);
+        return true;
     }
 
     /**

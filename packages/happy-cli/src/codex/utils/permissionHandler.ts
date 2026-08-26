@@ -8,6 +8,7 @@
 import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
 import type { AgentState } from "@/api/types";
+import { createEnvelope } from '@slopus/happy-wire';
 import {
     BasePermissionHandler,
     PermissionResult,
@@ -21,6 +22,8 @@ export type { PermissionResult, PendingRequest };
  * Codex-specific permission handler.
  */
 export class CodexPermissionHandler extends BasePermissionHandler {
+    private readonly announceTextApprovals: boolean;
+
     // Exact tool names that should always be auto-approved. Include the bare
     // form (used by Codex elicitation messages like `tool "change_title"`)
     // and the MCP-qualified form for defense in depth.
@@ -37,8 +40,9 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         'change_title',
     ];
 
-    constructor(session: ApiSessionClient) {
+    constructor(session: ApiSessionClient, options?: { announceTextApprovals?: boolean }) {
         super(session);
+        this.announceTextApprovals = options?.announceTextApprovals === true;
     }
 
     protected getLogPrefix(): string {
@@ -110,7 +114,64 @@ export class CodexPermissionHandler extends BasePermissionHandler {
             // Update agent state with pending request
             this.addPendingRequestToState(toolCallId, toolName, input);
 
+            if (this.announceTextApprovals) {
+                this.sendTextNotice(
+                    `Codex is waiting for approval to use ${toolName}. `
+                    + 'Reply /approve (允许) to continue or /deny (拒绝) to reject.'
+                );
+            }
+
             logger.debug(`${this.getLogPrefix()} Permission request sent for tool: ${toolName} (${toolCallId})`);
         });
+    }
+
+    /**
+     * Resolve the oldest pending approval from an exact text command.
+     * This is enabled only for ISCP text-only sessions, whose grant cannot
+     * receive the raw agent-state approval card used by the official app.
+     */
+    tryHandleTextPermissionResponse(text: string): boolean {
+        if (!this.announceTextApprovals) {
+            return false;
+        }
+
+        const normalized = text.trim().toLocaleLowerCase('en-US');
+        const approve = new Set(['/approve', 'approve', '允许', '同意', '批准']);
+        const deny = new Set(['/deny', 'deny', '拒绝', '不允许']);
+        if (!approve.has(normalized) && !deny.has(normalized)) {
+            return false;
+        }
+
+        const oldest = this.pendingRequests.entries().next().value as
+            | [string, PendingRequest]
+            | undefined;
+        if (!oldest) {
+            return false;
+        }
+
+        const [id, pending] = oldest;
+        const approved = approve.has(normalized);
+        const handled = this.resolvePermissionResponse({
+            id,
+            approved,
+            decision: approved ? 'approved' : 'denied',
+        });
+        if (!handled) {
+            return false;
+        }
+
+        this.sendTextNotice(
+            approved
+                ? `Approved ${pending.toolName}. Codex is continuing.`
+                : `Denied ${pending.toolName}. Codex will continue without it.`
+        );
+        return true;
+    }
+
+    private sendTextNotice(text: string): void {
+        this.session.sendSessionProtocolMessage(createEnvelope('agent', {
+            t: 'text',
+            text,
+        }));
     }
 }

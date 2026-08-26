@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { projectPhoneTextView } from '@slopus/happy-wire';
 import { CodexPermissionHandler } from '../utils/permissionHandler';
 
 vi.mock('@/ui/logger', () => ({
@@ -19,6 +20,7 @@ function createSessionMock() {
                 state = updater(state);
                 return state;
             }),
+            sendSessionProtocolMessage: vi.fn(),
         },
         getState: () => state,
     };
@@ -61,6 +63,70 @@ describe('CodexPermissionHandler', () => {
 
         handler.abortAll();
 
+        await expect(pending).resolves.toEqual({ decision: 'abort' });
+    });
+
+    it('makes ISCP text-only approval visible and accepts an explicit text approval', async () => {
+        const { session, getState } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any, {
+            announceTextApprovals: true,
+        });
+
+        const pending = handler.handleToolCall(
+            'call_exec_123',
+            'CodexBash',
+            { command: 'curl https://example.com' },
+        );
+
+        expect(session.sendSessionProtocolMessage).toHaveBeenCalledTimes(1);
+        const approvalPrompt = vi.mocked(session.sendSessionProtocolMessage).mock.calls[0][0];
+        expect(projectPhoneTextView({ role: 'session', content: approvalPrompt })).toMatchObject({
+            kind: 'session-text',
+            emit: {
+                role: 'agent',
+                content: {
+                    type: 'text',
+                    text: expect.stringContaining('/approve'),
+                },
+            },
+        });
+        expect(JSON.stringify(approvalPrompt)).not.toContain('https://example.com');
+
+        expect(handler.tryHandleTextPermissionResponse('允许')).toBe(true);
+        await expect(pending).resolves.toEqual({ decision: 'approved' });
+        expect(getState().requests).toEqual({});
+        expect(getState().completedRequests.call_exec_123).toMatchObject({
+            status: 'approved',
+            decision: 'approved',
+        });
+        expect(session.sendSessionProtocolMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects an ISCP text-only approval with an explicit deny command', async () => {
+        const { session, getState } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any, {
+            announceTextApprovals: true,
+        });
+        const pending = handler.handleToolCall('call_exec_123', 'CodexBash', { command: 'pwd' });
+
+        expect(handler.tryHandleTextPermissionResponse('/deny')).toBe(true);
+        await expect(pending).resolves.toEqual({ decision: 'denied' });
+        expect(getState().completedRequests.call_exec_123).toMatchObject({
+            status: 'denied',
+            decision: 'denied',
+        });
+    });
+
+    it('does not consume ordinary text or enable text approval outside ISCP-only mode', async () => {
+        const { session } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+        const pending = handler.handleToolCall('call_exec_123', 'CodexBash', { command: 'pwd' });
+
+        expect(handler.tryHandleTextPermissionResponse('hello')).toBe(false);
+        expect(handler.tryHandleTextPermissionResponse('/approve')).toBe(false);
+        expect(session.sendSessionProtocolMessage).not.toHaveBeenCalled();
+
+        handler.abortAll();
         await expect(pending).resolves.toEqual({ decision: 'abort' });
     });
 

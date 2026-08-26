@@ -25,6 +25,21 @@ const postList = async (port: number): Promise<Record<string, unknown>> => {
   return await response.json() as Record<string, unknown>
 }
 
+const postReopen = async (
+  port: number,
+  body: { profileId?: string } = {},
+): Promise<{ status: number; body: Record<string, unknown> }> => {
+  const response = await fetch(`http://127.0.0.1:${port}/iscp/reopen`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  return {
+    status: response.status,
+    body: await response.json() as Record<string, unknown>,
+  }
+}
+
 describe('control server /list', () => {
   let stop: (() => Promise<void>) | null = null
   afterEach(async () => {
@@ -74,5 +89,36 @@ describe('control server /list', () => {
     const body = await postList(server.port)
     expect(body.children).toEqual([])
     expect(body.iscpAgents).toBeUndefined()
+  })
+
+  it('forwards a bounded Session-only reopen to the selected profile', async () => {
+    const requests: Array<string | undefined> = []
+    const server = await startDaemonControlServer({
+      ...baseDeps,
+      getChildren: () => [],
+      reopenIscpPeers: (profileId) => {
+        requests.push(profileId)
+        return { profiles: profileId === undefined ? ['p1', 'p2'] : [profileId] }
+      },
+    })
+    stop = server.stop
+
+    await expect(postReopen(server.port, { profileId: 'p2' })).resolves.toEqual({
+      status: 200,
+      body: { profiles: ['p2'] },
+    })
+    expect(requests).toEqual(['p2'])
+  })
+
+  it('fails closed when Session reopen is unavailable', async () => {
+    const server = await startDaemonControlServer({
+      ...baseDeps,
+      getChildren: () => [],
+    })
+    stop = server.stop
+
+    const response = await postReopen(server.port)
+    expect(response.status).toBe(503)
+    expect(response.body.error).toBe('ISCP is not enabled on this daemon')
   })
 })

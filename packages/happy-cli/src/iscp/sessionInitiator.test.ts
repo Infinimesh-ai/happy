@@ -68,6 +68,33 @@ describe('classifySessionFailure', () => {
 })
 
 describe('startSessionInitiator', () => {
+  it('authenticated reopen is single-flight and creates one fresh attempt', async () => {
+    let opens = 0
+    let current = { sessionId: 'sess-old', role: 'initiator' as const, lastAuthenticatedAt: Date.now() }
+    const before: string[] = []
+    const h = harness(async () => {
+      opens += 1
+      current = { sessionId: `sess-${opens}`, role: 'initiator', lastAuthenticatedAt: Date.now() }
+      return {}
+    }, {
+      superviseReopen: true,
+      sessionStatus: () => current,
+      onBeforeReopen: (cause) => before.push(cause),
+    })
+    const loop = startSessionInitiator(h.deps)
+    while (h.states.at(-1)?.state !== 'ready') await Promise.resolve()
+    expect(loop.requestReopen('peer_runtime_started')).toBe(true)
+    expect(loop.requestReopen('duplicate')).toBe(false)
+    while (opens < 2 || h.states.at(-1)?.state !== 'ready') await Promise.resolve()
+    expect(opens).toBe(2)
+    expect(before).toEqual(['peer_runtime_started'])
+    expect(h.closes).toEqual([PEER])
+    expect(h.states).toContainEqual({ state: 'peer_stale', detail: 'peer_runtime_started' })
+    expect(h.states.at(-1)).toEqual({ state: 'ready' })
+    loop.stop()
+    await loop.done
+  })
+
   it('success: connecting → ready, loop ends, no retries', async () => {
     const calls: string[] = []
     const h = harness(async (id) => {

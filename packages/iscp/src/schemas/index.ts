@@ -13,6 +13,7 @@ export * from './provisioningBundle';
 export * from './relayDescriptor';
 export * from './secureEnvelope';
 export * from './sessionHello';
+export * from './sessionReopen';
 export * from './sessionReady';
 export * from './signedDescriptor';
 export * from './trustGrant';

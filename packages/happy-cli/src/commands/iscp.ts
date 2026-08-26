@@ -518,8 +518,15 @@ async function printCheckLayers(
   const transportColor = peer.connectionState === 'READY' ? chalk.green : chalk.yellow
   console.log(`  [5] relay transport: ${transportColor(peer.connectionState)}`)
   const sessionLine = peer.sessionDetail !== undefined ? `${peer.session} (${peer.sessionDetail})` : peer.session
-  const sessionColor = peer.session === 'ready' ? chalk.green : peer.session === 'connecting' ? chalk.yellow : chalk.red
+  const sessionColor = peer.session === 'ready'
+    ? chalk.green
+    : ['connecting', 'peer_stale', 'reopening'].includes(peer.session)
+      ? chalk.yellow
+      : chalk.red
   console.log(`  [6] session:         ${sessionColor(sessionLine)} ${chalk.dim(`(peer ${peer.peerDeviceId})`)}`)
+  if (peer.sessionId !== undefined) {
+    console.log(`      id ${peer.sessionId}; role ${peer.sessionRole ?? 'unknown'}; attempts ${peer.sessionAttempt}; reopens ${peer.sessionReopenCount}; coalesced ${peer.sessionReopenCoalesceCount}`)
+  }
   if (peer.session === 'authorization_expired') {
     console.log(`      the grant has expired — run: happy iscp renew <renewal-id>`)
   }

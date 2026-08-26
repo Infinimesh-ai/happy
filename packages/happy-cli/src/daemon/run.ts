@@ -889,7 +889,8 @@ export async function startDaemon(): Promise<void> {
       onHappySessionWebhook,
       iscp,
       reloadIscpPeers: () => iscpPeers.reload(),
-      getIscpPeerStatuses: () => iscpPeers.statuses()
+      getIscpPeerStatuses: () => iscpPeers.statuses(),
+      reopenIscpPeers: (profileId) => iscpPeers.reopen(profileId)
     });
 
     // Write initial daemon state (no lock needed for state file)

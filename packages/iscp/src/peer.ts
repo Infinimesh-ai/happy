@@ -24,9 +24,9 @@
  * as business payloads.
  */
 
-import { fromBase64Url, toBase64Url, utf8Decode, utf8Encode } from './encoding';
+import { fromBase64Url, parseRfc3339, rfc3339Seconds, toBase64Url, utf8Decode, utf8Encode } from './encoding';
 import { IscpError, IscpErrorCodes, iscpError } from './errors';
-import type { Device } from './identity';
+import { identityThumbprint, type Device } from './identity';
 import { compareCodePoints } from './jcs';
 import { createNobleProvider } from './crypto/noble';
 import type { CryptoProvider } from './crypto/provider';
@@ -35,14 +35,18 @@ import { RelayWsClient, type RelayWsBackoff, type RelayWsState } from './relay/w
 import {
   SECURE_ENVELOPE_TYPE,
   SessionHelloSchema,
+  SessionReopenSchema,
   SessionReadySchema,
   type DeviceIdentity,
   type EnvelopeRoute,
   type RelayDescriptor,
   type SecureEnvelope,
+  type SessionReopen,
+  type SessionReopenCause,
   type TrustGrant,
 } from './schemas';
-import { SESSION_HELLO_TYPE, SESSION_READY_TYPE } from './schemas';
+import { SESSION_HELLO_TYPE, SESSION_READY_TYPE, SESSION_REOPEN_TYPE } from './schemas';
+import { signObject, verifyObjectSignature } from './signing';
 import { createHello, establish, type LocalHello, type SessionState } from './session/handshake';
 import { decryptEnvelope, encryptEnvelope } from './session/secureEnvelope';
 import type { ReplayStore } from './session/replay';
@@ -50,7 +54,16 @@ import type { WebSocketFactory } from './ws-adapter';
 
 export const CAPABILITY_MANIFEST_PAYLOAD_TYPE = 'agent.capability.v1';
 
-const HANDSHAKE_PAYLOAD_TYPES = new Set<string>([SESSION_HELLO_TYPE, SESSION_READY_TYPE]);
+const HANDSHAKE_PAYLOAD_TYPES = new Set<string>([SESSION_HELLO_TYPE, SESSION_READY_TYPE, SESSION_REOPEN_TYPE]);
+const SESSION_REOPEN_TTL_MS = 30_000;
+
+export interface SessionDiagnosticEvent {
+  peerDeviceId: string;
+  sessionId?: string;
+  role?: 'initiator' | 'responder';
+  event: 'create' | 'replace' | 'tombstone' | 'reopen_sent' | 'reopen_accepted' | 'reopen_rejected' | 'reopen_coalesced';
+  cause?: string;
+}
 
 interface PeerSession {
   sessionId: string;
@@ -61,7 +74,18 @@ interface PeerSession {
   state?: SessionState;
   manifestSent: boolean;
   peerManifest?: unknown;
+  /** Last successfully authenticated inbound frame from this peer. */
+  lastAuthenticatedAt?: number;
   readyWaiters: Array<{ resolve: (manifest: unknown) => void; reject: (error: unknown) => void }>;
+}
+
+/** Metadata-only view of a peer session. Never exposes transcript keys or payloads. */
+export interface PeerSessionStatus {
+  sessionId: string;
+  role: PeerSession['role'];
+  ready: boolean;
+  manifestExchanged: boolean;
+  lastAuthenticatedAt?: number;
 }
 
 export interface IscpPeerOptions {
@@ -112,6 +136,10 @@ export interface IscpPeerOptions {
   onPayload?: (peerDeviceId: string, payloadType: string, plaintext: Uint8Array, envelope: SecureEnvelope) => void;
   /** Fires once per session when capability manifests have been exchanged. */
   onPeerReady?: (peerDeviceId: string, manifest: unknown) => void;
+  /** Authenticated, grant-authorized request for the Happy initiator to rotate the transcript. */
+  onSessionReopen?: (request: SessionReopen) => void;
+  /** Metadata only. Never contains signed objects, manifests, credentials, or plaintext. */
+  onSessionDiagnostic?: (event: SessionDiagnosticEvent) => void;
   onConnectionState?: (state: RelayWsState) => void;
   onError?: (error: unknown) => void;
   now?: () => Date;
@@ -130,6 +158,8 @@ export class IscpPeer {
    * the same initiator make both sides flip between the session ids forever.
    */
   private readonly staleSessionIds = new Map<string, Set<string>>();
+  /** Short-lived authenticated reopen replay window, bounded per peer. */
+  private readonly seenReopenRequestIds = new Map<string, string[]>();
   private readonly outboundQueue: SecureEnvelope[] = [];
   private accessToken: string;
   private refreshToken: string;
@@ -183,6 +213,19 @@ export class IscpPeer {
     return this.outboundQueue.length;
   }
 
+  /** Metadata-only session status for liveness supervision and diagnostics. */
+  sessionStatus(peerDeviceId: string): PeerSessionStatus | undefined {
+    const session = this.sessions.get(peerDeviceId);
+    if (!session) return undefined;
+    return {
+      sessionId: session.sessionId,
+      role: session.role,
+      ready: session.state?.ready ?? false,
+      manifestExchanged: session.manifestSent && session.peerManifest !== undefined,
+      ...(session.lastAuthenticatedAt !== undefined ? { lastAuthenticatedAt: session.lastAuthenticatedAt } : {}),
+    };
+  }
+
   start(): void {
     this.ws.start();
   }
@@ -202,6 +245,14 @@ export class IscpPeer {
     if (!session) return;
     this.sessions.delete(peerDeviceId);
     this.markSessionStale(peerDeviceId, session.sessionId);
+    this.opts.onSessionDiagnostic?.({
+      peerDeviceId,
+      sessionId: session.sessionId,
+      role: session.role,
+      event: 'tombstone',
+      cause: 'local_close',
+    });
+    this.dropQueuedSessionEnvelopes(session.sessionId);
     const error = iscpError(IscpErrorCodes.SessionInvalid, 'session closed locally before peer became ready', { retryable: true });
     for (const waiter of session.readyWaiters.splice(0)) waiter.reject(error);
   }
@@ -230,6 +281,13 @@ export class IscpPeer {
         readyWaiters: [],
       };
       this.sessions.set(peerDeviceId, session);
+      this.opts.onSessionDiagnostic?.({
+        peerDeviceId,
+        sessionId,
+        role: 'initiator',
+        event: 'create',
+        cause: 'open_session',
+      });
       await this.submitHandshake(peerDeviceId, sessionId, SESSION_HELLO_TYPE, local.hello);
     }
     // The awaits above suspend: our just-created session can lose a
@@ -242,6 +300,54 @@ export class IscpPeer {
       throw iscpError(IscpErrorCodes.SessionInvalid, 'session was closed while opening', { retryable: true });
     }
     return this.waitForPeerReady(current, opts?.timeoutMs ?? 60_000);
+  }
+
+  /**
+   * Ask the grant-authorized peer to replace its cached Session state. This
+   * control request is deliberately not queued while offline: it expires in
+   * 30 seconds and a later runtime/activation must create a new request.
+   */
+  async requestSessionReopen(peerDeviceId: string, cause: SessionReopenCause): Promise<string> {
+    if (this.ws.currentState !== 'READY') {
+      throw iscpError(IscpErrorCodes.AccessInvalid, 'relay receive channel is not READY for session reopen', { retryable: true });
+    }
+    const issued = this.now();
+    const requestId = `reopen-${toBase64Url(this.provider.randomBytes(12))}`;
+    const unsigned = {
+      type: SESSION_REOPEN_TYPE,
+      request_id: requestId,
+      domain_id: this.opts.device.identity.domain_id,
+      device_id: this.opts.device.identity.device_id,
+      peer_device_id: peerDeviceId,
+      relay_id: this.opts.relayDescriptor.relay_id,
+      cause,
+      issued_at: rfc3339Seconds(issued),
+      expires_at: rfc3339Seconds(new Date(issued.getTime() + SESSION_REOPEN_TTL_MS)),
+      nonce: toBase64Url(this.provider.randomBytes(16)),
+    };
+    const request = SessionReopenSchema.parse(signObject(
+      this.provider,
+      SESSION_REOPEN_TYPE,
+      unsigned,
+      this.opts.device.privateKey,
+      this.opts.device.identity.public_key.kid,
+    ));
+    const envelope: SecureEnvelope = {
+      type: SECURE_ENVELOPE_TYPE,
+      domain_id: this.opts.device.identity.domain_id,
+      message_id: `ctl-${toBase64Url(this.provider.randomBytes(12))}`,
+      session_id: requestId,
+      sender_device_id: this.opts.device.identity.device_id,
+      recipient_device_id: peerDeviceId,
+      sequence: 0,
+      nonce: toBase64Url(this.provider.randomBytes(12)),
+      payload_type: SESSION_REOPEN_TYPE,
+      route: this.route(30),
+      ciphertext: toBase64Url(utf8Encode(JSON.stringify(request))),
+    };
+    await this.submit(envelope);
+    this.opts.onSessionDiagnostic?.({ peerDeviceId, event: 'reopen_sent', cause });
+    return requestId;
   }
 
   /** Send a business payload. Forbidden before session.ready + manifest exchange. */
@@ -296,11 +402,21 @@ export class IscpPeer {
       await this.handleReady(envelope);
       return;
     }
+    if (envelope.payload_type === SESSION_REOPEN_TYPE) {
+      await this.handleSessionReopen(envelope);
+      return;
+    }
+    // A close/rekey tombstones the previous transcript. Frames already in
+    // the relay may still arrive, but they must not be decrypted against or
+    // reported as failures on the replacement session.
+    if (this.isSessionStale(envelope.sender_device_id, envelope.session_id)) return;
     const session = this.sessions.get(envelope.sender_device_id);
     if (!session?.state?.ready) {
       throw iscpError(IscpErrorCodes.SessionInvalid, 'business payload received before session.ready');
     }
+    if (session.sessionId !== envelope.session_id) return;
     const plaintext = decryptEnvelope(this.provider, session.state, envelope);
+    session.lastAuthenticatedAt = this.now().getTime();
     if (envelope.payload_type === this.manifestPayloadType) {
       session.peerManifest = JSON.parse(utf8Decode(plaintext));
       this.opts.onPeerReady?.(session.peerDeviceId, session.peerManifest);
@@ -335,6 +451,13 @@ export class IscpPeer {
       }
       this.sessions.delete(peerDeviceId);
       this.markSessionStale(peerDeviceId, session.sessionId);
+      this.opts.onSessionDiagnostic?.({
+        peerDeviceId,
+        sessionId: session.sessionId,
+        role: session.role,
+        event: 'replace',
+        cause: 'competing_hello',
+      });
       carriedWaiters = session.readyWaiters.splice(0);
       session = undefined;
     }
@@ -358,9 +481,17 @@ export class IscpPeer {
         local,
         state,
         manifestSent: false,
+        lastAuthenticatedAt: this.now().getTime(),
         readyWaiters: carriedWaiters,
       };
       this.sessions.set(peerDeviceId, session);
+      this.opts.onSessionDiagnostic?.({
+        peerDeviceId,
+        sessionId: hello.session_id,
+        role: 'responder',
+        event: 'create',
+        cause: 'verified_hello',
+      });
       await this.submitHandshake(peerDeviceId, hello.session_id, SESSION_HELLO_TYPE, local.hello);
       await this.submitHandshake(peerDeviceId, hello.session_id, SESSION_READY_TYPE, state.createReady(this.provider, this.opts.device));
       return;
@@ -370,7 +501,82 @@ export class IscpPeer {
     session.state = establish(this.provider, session.local, hello, this.opts.device.identity, session.peerIdentity, {
       replayStore: this.opts.replayStoreFor?.(session.sessionId, peerDeviceId),
     });
+    session.lastAuthenticatedAt = this.now().getTime();
     await this.submitHandshake(peerDeviceId, session.sessionId, SESSION_READY_TYPE, session.state.createReady(this.provider, this.opts.device));
+  }
+
+  private async handleSessionReopen(envelope: SecureEnvelope): Promise<void> {
+    let request: SessionReopen | undefined;
+    try {
+      request = SessionReopenSchema.parse(JSON.parse(utf8Decode(fromBase64Url(envelope.ciphertext))));
+      const local = this.opts.device.identity;
+      const grant = this.opts.grant;
+      if (envelope.domain_id !== local.domain_id || request.domain_id !== local.domain_id) {
+        throw iscpError(IscpErrorCodes.TrustInvalid, 'session reopen domain mismatch');
+      }
+      if (envelope.sender_device_id !== request.device_id ||
+        envelope.recipient_device_id !== request.peer_device_id ||
+        envelope.session_id !== request.request_id ||
+        request.peer_device_id !== local.device_id) {
+        throw iscpError(IscpErrorCodes.TrustInvalid, 'session reopen envelope binding mismatch');
+      }
+      if (request.relay_id !== this.opts.relayDescriptor.relay_id ||
+        envelope.route.relay_id !== request.relay_id ||
+        envelope.route.ttl_seconds < 1 || envelope.route.ttl_seconds > 30) {
+        throw iscpError(IscpErrorCodes.TrustInvalid, 'session reopen relay constraint mismatch');
+      }
+      if (grant.subject_device_id !== local.device_id ||
+        grant.audience !== request.device_id ||
+        identityThumbprint(this.provider, local) !== grant.confirmation_thumbprint ||
+        (grant.relay_constraints !== undefined && !grant.relay_constraints.includes(request.relay_id))) {
+        throw iscpError(IscpErrorCodes.TrustInvalid, 'session reopen is not authorized by the current grant');
+      }
+      const now = this.now().getTime();
+      const grantNotBefore = parseRfc3339(grant.not_before).getTime();
+      const grantExpires = parseRfc3339(grant.expires_at).getTime();
+      const issued = parseRfc3339(request.issued_at).getTime();
+      const expires = parseRfc3339(request.expires_at).getTime();
+      if (grantNotBefore > now || grantExpires <= now) {
+        throw iscpError(IscpErrorCodes.TrustInvalid, 'session reopen grant is not currently valid');
+      }
+      if (issued > now + 5_000 || expires <= now || expires < issued || expires - issued > SESSION_REOPEN_TTL_MS) {
+        throw iscpError(IscpErrorCodes.SignatureInvalid, 'session reopen is outside its allowed time window');
+      }
+      const ids = this.seenReopenRequestIds.get(request.device_id) ?? [];
+      if (ids.includes(request.request_id)) {
+        this.opts.onSessionDiagnostic?.({
+          peerDeviceId: request.device_id,
+          event: 'reopen_coalesced',
+          cause: 'duplicate_request',
+        });
+        return;
+      }
+      const identity = await this.opts.resolvePeerIdentity(request.device_id);
+      if (identity.domain_id !== request.domain_id || identity.device_id !== request.device_id ||
+        request.signature.kid !== identity.public_key.kid) {
+        throw iscpError(IscpErrorCodes.TrustInvalid, 'session reopen identity mismatch');
+      }
+      verifyObjectSignature(
+        this.provider,
+        SESSION_REOPEN_TYPE,
+        request,
+        identity.public_key.public,
+        IscpErrorCodes.SignatureInvalid,
+        'session reopen signature verification failed',
+      );
+      ids.push(request.request_id);
+      if (ids.length > 64) ids.splice(0, ids.length - 64);
+      this.seenReopenRequestIds.set(request.device_id, ids);
+      this.opts.onSessionDiagnostic?.({ peerDeviceId: request.device_id, event: 'reopen_accepted', cause: request.cause });
+      this.opts.onSessionReopen?.(request);
+    } catch (error) {
+      this.opts.onSessionDiagnostic?.({
+        peerDeviceId: request?.device_id ?? envelope.sender_device_id,
+        event: 'reopen_rejected',
+        cause: error instanceof IscpError ? error.code : 'invalid_control',
+      });
+      throw error;
+    }
   }
 
   private async handleReady(envelope: SecureEnvelope): Promise<void> {
@@ -383,6 +589,7 @@ export class IscpPeer {
     }
     if (session.state.ready) return; // duplicate ready
     session.state.verifyReady(this.provider, ready, session.peerIdentity);
+    session.lastAuthenticatedAt = this.now().getTime();
     // First business payload after ready: our capability manifest.
     if (!session.manifestSent) {
       session.manifestSent = true;
@@ -405,6 +612,14 @@ export class IscpPeer {
 
   private isSessionStale(peerDeviceId: string, sessionId: string): boolean {
     return this.staleSessionIds.get(peerDeviceId)?.has(sessionId) ?? false;
+  }
+
+  private dropQueuedSessionEnvelopes(sessionId: string): void {
+    for (let index = this.outboundQueue.length - 1; index >= 0; index -= 1) {
+      if (this.outboundQueue[index]?.session_id === sessionId) {
+        this.outboundQueue.splice(index, 1);
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -431,10 +646,10 @@ export class IscpPeer {
     });
   }
 
-  private route(): EnvelopeRoute {
+  private route(ttlSeconds?: number): EnvelopeRoute {
     return {
       relay_id: this.opts.relayDescriptor.relay_id,
-      ttl_seconds: this.opts.route?.ttl_seconds ?? 600,
+      ttl_seconds: ttlSeconds ?? this.opts.route?.ttl_seconds ?? 600,
       priority: this.opts.route?.priority ?? 5,
     };
   }

@@ -13,6 +13,12 @@
  *   GET  /info    → { daemonDeviceId, profileId }
  *   POST /ingest  → { sessionId, localId?, body }  (simulates a session tee
  *                    append, which fans out to events.subscribe'd peers)
+ *
+ * Each scripted spawn also starts a real localhost session RPC endpoint. A
+ * user message delivered through Happy's WireResponder is acknowledged there
+ * and echoed back through the daemon event log as a visible Agent reply. This
+ * keeps the external-client acceptance honest: messages.send must reach an
+ * active spawned session, not merely persist in the outbox.
  */
 
 import fastify from 'fastify'
@@ -42,12 +48,44 @@ async function main(): Promise<void> {
 
   const iscp = new DaemonIscpService()
   let spawnCounter = 0
+  let replyCounter = 0
+  const rpcServers: Array<ReturnType<typeof fastify>> = []
   const peers = await startDaemonIscpPeers({
     iscp,
     getChildren: () => [],
     stopSession: () => true,
     // Unique per spawn so repeated external test runs get isolated logs.
-    spawnSession: async () => ({ type: 'success' as const, sessionId: `sess-swift-e2e-${++spawnCounter}` }),
+    spawnSession: async () => {
+      const sessionId = `sess-swift-e2e-${++spawnCounter}`
+      const rpc = fastify({ logger: false })
+      rpc.post('/rpc', async (request, reply) => {
+        const body = request.body as { method?: unknown; params?: unknown }
+        if (body.method !== 'iscp.user-message') {
+          reply.code(500)
+          return { ok: false as const, error: `unsupported scripted RPC method ${String(body.method)}` }
+        }
+
+        const nextReply = ++replyCounter
+        iscp.ingest(profileId, sessionId, [{
+          localId: `agent-reply-${nextReply}`,
+          body: {
+            role: 'session',
+            content: {
+              id: `swift-e2e-agent-${nextReply}`,
+              time: Date.now(),
+              role: 'agent',
+              ev: { t: 'text', text: `agent reply ${nextReply}` },
+            },
+          },
+        }])
+        return { ok: true as const, result: null }
+      })
+      const address = await rpc.listen({ port: 0, host: '127.0.0.1' })
+      const port = Number(new URL(address).port)
+      rpcServers.push(rpc)
+      iscp.registerSessionRpcPort(profileId, sessionId, port)
+      return { type: 'success' as const, sessionId }
+    },
   })
   if (!peers.profiles.includes(profileId)) {
     throw new Error('daemon peer failed to come online')
@@ -72,7 +110,10 @@ async function main(): Promise<void> {
 
   const shutdown = () => {
     peers.stop()
-    void ctrl.close().then(() => process.exit(0))
+    void Promise.all([
+      ctrl.close(),
+      ...rpcServers.map((rpc) => rpc.close()),
+    ]).then(() => process.exit(0))
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)

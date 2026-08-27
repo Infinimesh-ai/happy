@@ -50,6 +50,9 @@ import {
   utf8Encode,
   verifyGrant,
   verifyPairingTicket,
+  verifyPairingTicketV3,
+  bindGrantRoles,
+  PAIRING_TICKET_V3_TYPE,
   verifyRelayDescriptor,
   verifyTrustRootDescriptor,
   type CryptoProvider,
@@ -364,7 +367,16 @@ function verifyTicketAgainstDescriptors(
   if (!signingKey) {
     throw new Error('pairing ticket is not signed by an active trust root key')
   }
-  verifyPairingTicket(provider, ticket, signingKey.public)
+  if (ticket.type === PAIRING_TICKET_V3_TYPE) {
+    verifyPairingTicketV3(provider, ticket, signingKey.public)
+    // The v0.2 ticket carries the inviting phone in the signed object; a
+    // wrapper hint that disagrees means the transport was assembled wrong.
+    if (payload.expectedAudiencePhoneId !== undefined && payload.expectedAudiencePhoneId !== ticket.grant_audience) {
+      throw new Error(`pairing ticket grant audience ${ticket.grant_audience} does not match the wrapper's expected phone ${payload.expectedAudiencePhoneId}`)
+    }
+  } else {
+    verifyPairingTicket(provider, ticket, signingKey.public)
+  }
 }
 
 /**
@@ -591,9 +603,14 @@ export async function enroll(opts: EnrollOptions): Promise<{ profileId: string; 
     let grant: TrustGrant
 
     if (payload !== undefined) {
-      // 3. Managed provisioning (Infinimesh Cloud v2 signed-ticket contract):
-      //    one call registers the device, issues relay credentials, and returns
-      //    the pre-authorized Trust Grant. No trust self-authorization here.
+      // 3. Managed provisioning (signed-ticket contract; ISCP v0.2 tickets
+      //    additionally freeze the grant role invariants). A v3 ticket whose
+      //    grant_audience is this very device is the audience-reversal
+      //    failure mode — reject locally before the one-time ticket is
+      //    consumed server-side.
+      if (payload.ticket.type === PAIRING_TICKET_V3_TYPE) {
+        bindGrantRoles(provider, payload.ticket, device.identity)
+      }
       const registration = await relayHttp.registerWithSignedTicket(device, payload.ticket, {
         displayName: payload.displayName ?? opts.displayName,
         metadata: { product_kind: 'happy', runtime_kind: 'happy-cli' },

@@ -1,0 +1,150 @@
+{
+  "agent": {
+    "identity": {
+      "created_at": "2026-01-02T03:04:05Z",
+      "device_id": "agent-vector-1",
+      "domain_id": "local",
+      "public_key": {
+        "kid": "JsU0S1ai-9_fwywswfmYK5jkgaa3zebyOYDQ0bdKln8",
+        "kty": "Ed25519",
+        "public": "1a3HNOZoqHAx75_jHIRZ1AegRTmCFJR7Sh_v2EaNzgU",
+        "use": "identity-signature"
+      },
+      "type": "iscp.device.identity.v2"
+    },
+    "seed_hex": "3b9252c258220fe4ef6d5c2a322113f89a5b942d7a2478e0c7fc59a64c100ece"
+  },
+  "credential_recovery": {
+    "challenge_sample": {
+      "challenge": "idem-key-1\u0000JW4jY5FBios64-U3i81rUwswE8blJUs3asTLqRC1nks",
+      "idempotency_key": "idem-key-1",
+      "wrap_public": "JW4jY5FBios64-U3i81rUwswE8blJUs3asTLqRC1nks"
+    },
+    "plaintext_hex": "7b22616363657373223a7b2263726564656e7469616c5f6964223a22637265645f61222c22746f6b656e223a22746f6b5f61222c22646f6d61696e5f6964223a226c6f63616c222c226465766963655f6964223a226167656e742d766563746f722d31222c226973737565645f6174223a22323032362d30312d30325430333a30343a30355a222c22657870697265735f6174223a22323032362d30312d30325430333a31393a30355a227d2c2272656672657368223a7b2263726564656e7469616c5f6964223a22637265645f72222c22746f6b656e223a22746f6b5f72222c22646f6d61696e5f6964223a226c6f63616c222c226465766963655f6964223a226167656e742d766563746f722d31222c226973737565645f6174223a22323032362d30312d30325430333a30343a30355a222c22657870697265735f6174223a22323032362d30312d30335430333a30343a30355a222c22726f746174696f6e5f636f756e746572223a317d7d",
+    "transcript": {
+      "device_id": "agent-vector-1",
+      "domain_id": "local",
+      "thumbprint": "JsU0S1ai-9_fwywswfmYK5jkgaa3zebyOYDQ0bdKln8"
+    },
+    "wrap_private_hex": "9c4cd1723535625ccd0bf481ab5e51b940860e78b41428bf8671ea8b90f85beb",
+    "wrap_public": "JW4jY5FBios64-U3i81rUwswE8blJUs3asTLqRC1nks",
+    "wrapped": {
+      "ciphersuite": "ISCP_V2_X25519_HKDF_SHA256_CHACHA20POLY1305",
+      "ciphertext": "V-Neu_SNjTh25LZVU1QihznW_1dl9BLIjySgXucz1FYeFmiGtBPRNi0IAQ3TZkBLVRcb751kz7lt1tykj4lR8D0U72HeXaIoytTSkJhOb6BI8vBNmdfFv_LlOnH6xcorPWI3ilOg_f_Sl0CQMt8A02xO3ru_bOdhfvsMPIc46FSB-foGEqcuhQHS_AT1n_fNI8p1l_grGkJOoqwV5IjmKQGTAIDY_LDk74SkqqJRCtGuvfthTf_LtNHtjFrKFGriA3tQQb0N_FxuZGIpAJYtcMl1inKcmz2n-8Es3dHmgKL4uQqzZXJfXT_6Bg7O0rHwZNefFTJy6ULYF141Xvf4Nvq9_Z_c1vfG1YdHZf6jaE7IcCE14LFcUDuDPHcAa0IB34TC_RN6DcNauJSxCdQgnhbDuSjDNtzaG-UHjsDB3zJl9Q38fB6QUg7qix-__6N83sI6nTMARsO9LvfUomRYfwCdg9bBkf-zXZONFKxinPCjj5q3Oo1JyceIwMjzkPc",
+      "nonce": "n9HFMy6kJm96vRIK",
+      "recovery_public_key": "JW4jY5FBios64-U3i81rUwswE8blJUs3asTLqRC1nks",
+      "server_public_key": "enguhdVEPBTfqqB2LTLgbg_xOkSpFdsHHblwERWwnis",
+      "type": "iscp.relay.credential_recovery.wrapped.v2"
+    }
+  },
+  "issuer": {
+    "identity": {
+      "created_at": "2026-01-02T03:04:05Z",
+      "device_id": "trust-local-signer",
+      "domain_id": "local",
+      "public_key": {
+        "kid": "wmf9a1mkQ7wcNzVzf4SG5j3b7wJ39s1QjU1SJwCiYt8",
+        "kty": "Ed25519",
+        "public": "XGatI4IJy-liUcE-4EV4bARdZYKfAKfJW3EygOkelc4",
+        "use": "identity-signature"
+      },
+      "type": "iscp.device.identity.v2"
+    },
+    "seed_hex": "6c0e196394d4d3399d4d073f7d726dcf2a984d604cb0d59bbd3edaa2e6a14998"
+  },
+  "meta": {
+    "generator": "packages/iscp/conformance-gen",
+    "note": "deterministic fixtures; private keys here are shared test material, not credentials",
+    "pin": "fa1d493c278f13e3588ad173c19695c9f5b9ec2d"
+  },
+  "phone": {
+    "identity": {
+      "created_at": "2026-01-02T03:04:05Z",
+      "device_id": "phone-vector-1",
+      "domain_id": "local",
+      "public_key": {
+        "kid": "JhUVtt9z6H0rZzp2js_3lLOYWphFVZ2ufFRfCWonrYk",
+        "kty": "Ed25519",
+        "public": "QFOJ4kV98JalLFrQMDstRcZktw-JJ-tR9V6uk2t799Q",
+        "use": "identity-signature"
+      },
+      "type": "iscp.device.identity.v2"
+    },
+    "seed_hex": "3bbae2d1ea25e30e1e51a69b17d09b3ac4d1287365de2d6f9fa67718dccba6a1"
+  },
+  "session_close": {
+    "frame": {
+      "device_id": "agent-vector-1",
+      "domain_id": "local",
+      "expires_at": "2026-01-02T03:04:35Z",
+      "issued_at": "2026-01-02T03:04:05Z",
+      "nonce": "WI2g49c8aIln2IrV-KfTlA",
+      "peer_device_id": "phone-vector-1",
+      "reason": "shutdown",
+      "relay_id": "relay-local",
+      "session_id": "session-vector-1",
+      "signature": {
+        "alg": "Ed25519",
+        "kid": "JsU0S1ai-9_fwywswfmYK5jkgaa3zebyOYDQ0bdKln8",
+        "value": "uIwlWFJsZL6LVcV5ZQSAyKXYyCpzD1YBuAYnz5G7JsBtDPbbtM8gEBRbV1_Dei773X5cR7IJ1q_Dgk6ckW_bDQ"
+      },
+      "type": "iscp.session.close.v1"
+    },
+    "verify_at": "2026-01-02T03:04:07Z"
+  },
+  "session_reopen": {
+    "frame": {
+      "cause": "runtime_started",
+      "device_id": "phone-vector-1",
+      "domain_id": "local",
+      "expires_at": "2026-01-02T03:04:35Z",
+      "issued_at": "2026-01-02T03:04:05Z",
+      "nonce": "gEkAqvQ2V9utkyVopVILyw",
+      "peer_device_id": "agent-vector-1",
+      "relay_id": "relay-local",
+      "request_id": "reopen-vector-1",
+      "signature": {
+        "alg": "Ed25519",
+        "kid": "JhUVtt9z6H0rZzp2js_3lLOYWphFVZ2ufFRfCWonrYk",
+        "value": "taHN8K929trQG63jlbxr4pIipY2ySP73G0xxooT654e3F64JVNuK8_KH7V4ZWgGQj4HACIfw3W9GC9LiZf1xCg"
+      },
+      "type": "iscp.session.reopen.v1"
+    },
+    "verify_at": "2026-01-02T03:04:07Z"
+  },
+  "ticket_v3": {
+    "audience_reversal_consumer": "phone-vector-1",
+    "grant_role_bindings": {
+      "audience": "phone-vector-1",
+      "confirmation_thumbprint": "JsU0S1ai-9_fwywswfmYK5jkgaa3zebyOYDQ0bdKln8",
+      "permissions": [
+        "text"
+      ],
+      "relay_id": "relay-local",
+      "subject_device_id": "agent-vector-1"
+    },
+    "ticket": {
+      "consumer_role": "member_device",
+      "domain_id": "local",
+      "expires_at": "2026-01-02T03:14:05Z",
+      "grant_audience": "phone-vector-1",
+      "grant_permissions": [
+        "text"
+      ],
+      "grant_ttl_seconds": 3600,
+      "issued_at": "2026-01-02T03:04:05Z",
+      "max_uses": 1,
+      "purpose": "invite",
+      "relay_id": "relay-local",
+      "signature": {
+        "alg": "Ed25519",
+        "kid": "wmf9a1mkQ7wcNzVzf4SG5j3b7wJ39s1QjU1SJwCiYt8",
+        "value": "UXRrYLDlj3zipvELm5PVidGZTUwKjr1rK9RXNmhqLb_m27bXCus_SSw_q0DaIFkF8nMjJUf6J2uSFqooM6LWAw"
+      },
+      "ticket_id": "ticket-v3-vector-1",
+      "trust_root_id": "trust-local",
+      "type": "iscp.pairing_ticket.v3"
+    },
+    "verify_at": "2026-01-02T03:05:05Z"
+  }
+}

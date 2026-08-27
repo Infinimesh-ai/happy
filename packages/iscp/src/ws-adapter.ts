@@ -22,8 +22,10 @@ export const defaultWebSocketFactory: WebSocketFactory = async (url: string) => 
   if (globalCtor) {
     return new globalCtor(url);
   }
-  // Opaque specifier keeps React Native bundlers from trying to resolve `ws`.
-  const specifier = 'ws';
-  const wsModule = (await import(/* @vite-ignore */ specifier)) as { default: new (url: string) => RawWebSocket };
+  // The indirection keeps every bundler (React Native Metro, rollup/pkgroll's
+  // dynamic-import analysis, vite) from trying to resolve `ws` statically;
+  // the bare `import(variable)` form started failing pkgroll >= 2.15.
+  const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<unknown>;
+  const wsModule = (await dynamicImport('ws')) as { default: new (url: string) => RawWebSocket };
   return new wsModule.default(url);
 };

@@ -17,9 +17,9 @@
  *   events.subscribe { }                     (live push flag; caller pulls backlog)
  *   wakeup.v1                                (Phase 4/5 hook point → unsupported)
  *
- * Deliberate Phase 3 scoping: ISCP sessions still create their legacy server
- * session (the machine keeps dual-stack credentials); history and RPC flow
- * through ISCP. Fully serverless sessions are a later phase.
+ * Network scoping: with a legacy token present, ISCP sessions also create
+ * their legacy server session (dual-stack); ISCP-only profiles run fully
+ * serverless (decideSessionNetwork/decideDaemonNetwork in networkStartup.ts).
  */
 
 import { createHash, randomUUID } from 'node:crypto'

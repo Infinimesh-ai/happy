@@ -8,8 +8,8 @@ CJS/ESM, runs on Node (happy-cli) and React Native/Hermes (happy-app).
 ## Spec pinning
 
 Everything here is derived from one upstream revision, recorded in
-[`scripts/pin.json`](scripts/pin.json) (commit `413d767b…`, which is upstream
-tag `v0.1.0`). The upstream conformance suite is a Go test package, not
+[`scripts/pin.json`](scripts/pin.json) (commit `fa1d493c…`, which is upstream
+tag `v0.2.0-rc.1`, the ISCP v0.2 pre-release). The upstream conformance suite is a Go test package, not
 portable vectors, so [`conformance-gen/`](conformance-gen/) imports the pinned
 Go module and emits deterministic cross-implementation vectors into
 [`test/vectors/`](test/vectors/); the vitest suite replays them against this

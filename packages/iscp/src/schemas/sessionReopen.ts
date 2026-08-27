@@ -3,7 +3,9 @@ import * as z from 'zod';
 import { Rfc3339Schema, SignatureSchema } from './common';
 
 /**
- * Happy's authenticated session-reopen control object.
+ * Authenticated session-reopen control frame. Originally a Happy-layer
+ * convention, codified as normative in ISCP v0.2 (spec/session.md,
+ * schemas/json/session.reopen.v1.json).
  *
  * This is intentionally not a Session Hello: responder-only phones do not
  * possess the Happy grant id. The phone signs a short-lived request with its

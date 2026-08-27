@@ -326,13 +326,11 @@ export async function runCodex(opts: {
     ];
 
     const handleUserMessage = createSerialAsyncHandler<UserMessage>(async (message) => {
-        if (permissionHandler.tryHandleTextPermissionResponse(message.content.text)) {
-            return;
-        }
-
-        const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
-
         // Resolve permission mode (validate against Codex-native modes)
+        // before consuming text-only approval commands. This lets the phone's
+        // "approve and enable YOLO" action update the live turn policy and
+        // resolve the current request atomically; later approvals in that
+        // same turn then observe the explicitly selected YOLO mode.
         let messagePermissionMode = currentPermissionMode;
         if (message.meta?.permissionMode) {
             const incoming = message.meta.permissionMode as PermissionMode;
@@ -347,6 +345,12 @@ export async function runCodex(opts: {
         } else {
             logger.debug(`[Codex] User message received with no permission mode override, using current: ${currentPermissionMode ?? 'default (effective)'}`);
         }
+
+        if (permissionHandler.tryHandleTextPermissionResponse(message.content.text)) {
+            return;
+        }
+
+        const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
 
         // Resolve model; explicit null resets to default (undefined)
         let messageModel = currentModel;

@@ -21,6 +21,7 @@ function createSessionMock() {
                 return state;
             }),
             sendSessionProtocolMessage: vi.fn(),
+            sendPhoneApproval: vi.fn(() => true),
         },
         getState: () => state,
     };
@@ -78,19 +79,24 @@ describe('CodexPermissionHandler', () => {
             { command: 'curl https://example.com' },
         );
 
-        expect(session.sendSessionProtocolMessage).toHaveBeenCalledTimes(1);
-        const approvalPrompt = vi.mocked(session.sendSessionProtocolMessage).mock.calls[0][0];
-        expect(projectPhoneTextView({ role: 'session', content: approvalPrompt })).toMatchObject({
-            kind: 'session-text',
+        expect(session.sendPhoneApproval).toHaveBeenCalledWith('CodexBash', 'pending');
+        expect(projectPhoneTextView({
+            role: 'happy-control',
+            content: { type: 'approval', toolName: 'CodexBash', status: 'pending' },
+        })).toMatchObject({
+            kind: 'phone-approval-pending',
             emit: {
                 role: 'agent',
                 content: {
-                    type: 'text',
-                    text: expect.stringContaining('/approve'),
+                    type: 'approval',
+                    toolName: 'CodexBash',
+                    status: 'pending',
+                    approveCommand: '/approve',
+                    denyCommand: '/deny',
                 },
             },
         });
-        expect(JSON.stringify(approvalPrompt)).not.toContain('https://example.com');
+        expect(JSON.stringify(vi.mocked(session.sendPhoneApproval).mock.calls)).not.toContain('https://example.com');
 
         expect(handler.tryHandleTextPermissionResponse('允许')).toBe(true);
         await expect(pending).resolves.toEqual({ decision: 'approved' });
@@ -99,7 +105,7 @@ describe('CodexPermissionHandler', () => {
             status: 'approved',
             decision: 'approved',
         });
-        expect(session.sendSessionProtocolMessage).toHaveBeenCalledTimes(2);
+        expect(session.sendPhoneApproval).toHaveBeenLastCalledWith('CodexBash', 'approved');
     });
 
     it('rejects an ISCP text-only approval with an explicit deny command', async () => {
@@ -124,7 +130,7 @@ describe('CodexPermissionHandler', () => {
 
         expect(handler.tryHandleTextPermissionResponse('hello')).toBe(false);
         expect(handler.tryHandleTextPermissionResponse('/approve')).toBe(false);
-        expect(session.sendSessionProtocolMessage).not.toHaveBeenCalled();
+        expect(session.sendPhoneApproval).not.toHaveBeenCalled();
 
         handler.abortAll();
         await expect(pending).resolves.toEqual({ decision: 'abort' });

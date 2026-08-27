@@ -70,8 +70,8 @@ describe('TextViewLog', () => {
     const first = new TextViewLog(raw, root)
     const firstPage = first.read('sess', 0, 100)!
 
-    rmSync(join(root, 'sessions', 'sess', 'textview.v1.jsonl'))
-    rmSync(join(root, 'sessions', 'sess', 'textview.v1.meta.json'))
+    rmSync(join(root, 'sessions', 'sess', 'textview.v2.jsonl'))
+    rmSync(join(root, 'sessions', 'sess', 'textview.v2.meta.json'))
     const second = new TextViewLog(new DaemonEventLog(root), root)
     const secondPage = second.read('sess', 0, 100)!
 
@@ -98,7 +98,7 @@ describe('TextViewLog', () => {
     const view = new TextViewLog(raw, root)
     view.sync('sess')
     // Simulate the crash window: rewind meta to before the last append.
-    const metaFile = join(root, 'sessions', 'sess', 'textview.v1.meta.json')
+    const metaFile = join(root, 'sessions', 'sess', 'textview.v2.meta.json')
     const meta = JSON.parse(readFileSync(metaFile, 'utf8'))
     writeFileSync(metaFile, JSON.stringify({ ...meta, lastViewSeq: 0, rawWatermark: 0 }))
 

@@ -8,7 +8,6 @@
 import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
 import type { AgentState } from "@/api/types";
-import { createEnvelope } from '@slopus/happy-wire';
 import {
     BasePermissionHandler,
     PermissionResult,
@@ -115,10 +114,7 @@ export class CodexPermissionHandler extends BasePermissionHandler {
             this.addPendingRequestToState(toolCallId, toolName, input);
 
             if (this.announceTextApprovals) {
-                this.sendTextNotice(
-                    `Codex is waiting for approval to use ${toolName}. `
-                    + 'Reply /approve (允许) to continue or /deny (拒绝) to reject.'
-                );
+                this.session.sendPhoneApproval(toolName, 'pending');
             }
 
             logger.debug(`${this.getLogPrefix()} Permission request sent for tool: ${toolName} (${toolCallId})`);
@@ -160,18 +156,7 @@ export class CodexPermissionHandler extends BasePermissionHandler {
             return false;
         }
 
-        this.sendTextNotice(
-            approved
-                ? `Approved ${pending.toolName}. Codex is continuing.`
-                : `Denied ${pending.toolName}. Codex will continue without it.`
-        );
+        this.session.sendPhoneApproval(pending.toolName, approved ? 'approved' : 'denied');
         return true;
-    }
-
-    private sendTextNotice(text: string): void {
-        this.session.sendSessionProtocolMessage(createEnvelope('agent', {
-            t: 'text',
-            text,
-        }));
     }
 }

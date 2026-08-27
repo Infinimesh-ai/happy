@@ -899,6 +899,34 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     /**
+     * Emit a phone-safe approval lifecycle record into the daemon event log.
+     * This surface exists only for ISCP sessions: legacy Happy clients receive
+     * their richer permission object through agent state instead.
+     */
+    sendPhoneApproval(toolName: string, status: 'pending' | 'approved' | 'denied'): boolean {
+        if (!this.iscpTee) {
+            return false;
+        }
+        const safeToolName = toolName
+            .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 160);
+        if (safeToolName === '') {
+            return false;
+        }
+        this.enqueueMessage({
+            role: 'happy-control',
+            content: {
+                type: 'approval',
+                toolName: safeToolName,
+                status,
+            },
+        });
+        return true;
+    }
+
+    /**
      * Send a generic agent message to the session using ACP (Agent Communication Protocol) format.
      * Works for any agent type (Gemini, Codex, Claude, etc.) - CLI normalizes to unified ACP format.
      * 

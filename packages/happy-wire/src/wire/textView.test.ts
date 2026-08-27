@@ -84,6 +84,67 @@ describe('projectPhoneTextView', () => {
     });
   });
 
+  it('projects phone approval lifecycle records without provider arguments or call ids', () => {
+    const pending = projectPhoneTextView({
+      role: 'happy-control',
+      content: {
+        type: 'approval',
+        toolName: 'CodexBash',
+        status: 'pending',
+        arguments: { command: 'curl https://example.com' },
+        callId: 'internal-call-id',
+      },
+    });
+    expect(pending).toEqual({
+      kind: 'phone-approval-pending',
+      emit: {
+        role: 'agent',
+        content: {
+          type: 'approval',
+          toolName: 'CodexBash',
+          status: 'pending',
+          approveCommand: '/approve',
+          denyCommand: '/deny',
+        },
+      },
+    });
+    expect(JSON.stringify(pending)).not.toContain('example.com');
+    expect(JSON.stringify(pending)).not.toContain('internal-call-id');
+    expect(PhoneTextViewBodySchema.safeParse(pending.emit).success).toBe(true);
+
+    for (const status of ['approved', 'denied'] as const) {
+      const completed = projectPhoneTextView({
+        role: 'happy-control',
+        content: { type: 'approval', toolName: 'CodexBash', status },
+      });
+      expect(completed).toEqual({
+        kind: `phone-approval-${status}`,
+        emit: {
+          role: 'agent',
+          content: { type: 'approval', toolName: 'CodexBash', status },
+        },
+      });
+      expect(PhoneTextViewBodySchema.safeParse(completed.emit).success).toBe(true);
+    }
+  });
+
+  it('rejects malformed approval cards at the phone-view schema boundary', () => {
+    expect(PhoneTextViewBodySchema.safeParse({
+      role: 'agent',
+      content: { type: 'approval', toolName: 'Bash', status: 'pending' },
+    }).success).toBe(false);
+    expect(PhoneTextViewBodySchema.safeParse({
+      role: 'agent',
+      content: {
+        type: 'approval',
+        toolName: 'Bash',
+        status: 'approved',
+        approveCommand: '/approve',
+        denyCommand: '/deny',
+      },
+    }).success).toBe(false);
+  });
+
   it('drops thinking text', () => {
     const projection = projectPhoneTextView(envelope({ t: 'text', text: 'internal reasoning', thinking: true }));
     expect(projection.emit).toBeNull();

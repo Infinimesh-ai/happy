@@ -1,4 +1,5 @@
 import * as z from 'zod';
+import { PHONE_TEXT_VIEW_PROTOCOL } from './textView';
 
 /**
  * agent.capability.v1 — Happy-level convention layered on top of ISCP.
@@ -43,7 +44,7 @@ export function defaultAgentCapabilityManifest(): AgentCapabilityManifest {
     device_type: 'agent_runtime',
     device_role: 'owner_runtime',
     runtime_kind: 'happy-agent',
-    protocol_versions: [AGENT_CAPABILITY_PROTOCOL, HAPPY_WIRE_PROTOCOL],
+    protocol_versions: [AGENT_CAPABILITY_PROTOCOL, HAPPY_WIRE_PROTOCOL, PHONE_TEXT_VIEW_PROTOCOL],
     capabilities: [
       { id: 'agent.sessions', version: 1 },
       { id: 'agent.conversation', version: 1 },

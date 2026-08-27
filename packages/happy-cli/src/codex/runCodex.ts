@@ -623,6 +623,13 @@ export async function runCodex(opts: {
     permissionHandler = new CodexPermissionHandler(session, {
         announceTextApprovals: api === null,
     });
+    // A previous process may have died before it could emit terminal events
+    // for its in-memory approvals. The v3 phone view treats this marker as a
+    // generation boundary and closes every still-pending card from that
+    // earlier process before accepting new approvals.
+    if (api === null) {
+        session.sendPhoneApprovalReset();
+    }
     // Drop any permission requests left in agent state from a previous CLI
     // process that died while a tool prompt was open — see the matching
     // call in claudeRemoteLauncher for the full rationale.

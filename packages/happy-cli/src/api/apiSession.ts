@@ -903,8 +903,16 @@ export class ApiSessionClient extends EventEmitter {
      * This surface exists only for ISCP sessions: legacy Happy clients receive
      * their richer permission object through agent state instead.
      */
-    sendPhoneApproval(toolName: string, status: 'pending' | 'approved' | 'denied'): boolean {
+    sendPhoneApproval(
+        approvalId: string,
+        toolName: string,
+        status: 'pending' | 'approved' | 'denied' | 'cancelled',
+    ): boolean {
         if (!this.iscpTee) {
+            return false;
+        }
+        const safeApprovalId = approvalId.trim().toLocaleLowerCase('en-US');
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(safeApprovalId)) {
             return false;
         }
         const safeToolName = toolName
@@ -919,8 +927,24 @@ export class ApiSessionClient extends EventEmitter {
             role: 'happy-control',
             content: {
                 type: 'approval',
+                approvalId: safeApprovalId,
                 toolName: safeToolName,
                 status,
+            },
+        });
+        return true;
+    }
+
+    /** Close any approval cards left by an earlier Agent process. */
+    sendPhoneApprovalReset(): boolean {
+        if (!this.iscpTee) {
+            return false;
+        }
+        this.enqueueMessage({
+            role: 'happy-control',
+            content: {
+                type: 'approval-reset',
+                reason: 'agent-restarted',
             },
         });
         return true;

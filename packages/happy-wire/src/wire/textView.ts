@@ -3,7 +3,7 @@ import { sessionEnvelopeSchema } from '../sessionProtocol';
 import { UserMessageSchema } from '../legacyProtocol';
 
 /**
- * happy/phone-text-view.v1 — the versioned phone-facing projection of a
+ * happy/phone-text-view.v3 — the versioned phone-facing projection of a
  * session's history (OPS 2026-08-18 §10.16).
  *
  * The daemon event log stores Happy's internal session protocol verbatim
@@ -11,8 +11,9 @@ import { UserMessageSchema } from '../legacyProtocol';
  * "consumers must normalize, do not add new consumers" contract — so a peer
  * whose Trust Grant only carries the `text` permission must never see it.
  * This module defines what such a peer IS allowed to see (plain user/agent
- * text bubbles) and the single pure projector that both messages.pull and
- * live happy/wire-event.v1 pushes go through.
+ * text bubbles plus redacted approval lifecycle cards) and the single pure
+ * projector that both messages.pull and live happy/wire-event.v1 pushes go
+ * through.
  *
  * Fail-closed by construction: anything the projector does not positively
  * recognize as visible text is dropped with a machine-readable kind/reason —
@@ -20,7 +21,7 @@ import { UserMessageSchema } from '../legacyProtocol';
  * against PhoneTextViewBodySchema at the responder edge as well.
  */
 
-export const PHONE_TEXT_VIEW_PROTOCOL = 'happy/phone-text-view.v1';
+export const PHONE_TEXT_VIEW_PROTOCOL = 'happy/phone-text-view.v3';
 
 /**
  * A grant permission that authorizes the raw internal session protocol.
@@ -45,9 +46,57 @@ export const PhoneTextViewUserBodySchema = z.object({
 });
 export type PhoneTextViewUserBody = z.infer<typeof PhoneTextViewUserBodySchema>;
 
+export const PhoneTextViewApprovalStatusSchema = z.enum(['pending', 'approved', 'denied', 'cancelled']);
+export type PhoneTextViewApprovalStatus = z.infer<typeof PhoneTextViewApprovalStatusSchema>;
+
+export const PhoneTextViewApprovalIdSchema = z.string().uuid();
+
+export const PhoneTextViewAgentContentSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('text'), text: z.string().min(1) }),
+  z.object({
+    type: z.literal('approval-reset'),
+    reason: z.literal('agent-restarted'),
+  }),
+  z.object({
+    type: z.literal('approval'),
+    approvalId: PhoneTextViewApprovalIdSchema,
+    toolName: z.string().min(1).max(160),
+    status: PhoneTextViewApprovalStatusSchema,
+    /** Legacy commands keep build 19 usable while v3 clients roll out. */
+    approveCommand: z.literal('/approve').optional(),
+    denyCommand: z.literal('/deny').optional(),
+    /** v3 commands bind the action to one opaque, session-local approval. */
+    targetedApproveCommand: z.string().min(1).max(64).optional(),
+    targetedDenyCommand: z.string().min(1).max(64).optional(),
+  }).superRefine((content, ctx) => {
+    const commands = [
+      content.approveCommand,
+      content.denyCommand,
+      content.targetedApproveCommand,
+      content.targetedDenyCommand,
+    ];
+    const hasCommands = commands.every((command) => command !== undefined);
+    if (content.status === 'pending') {
+      if (!hasCommands) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'pending approvals require all commands' });
+      }
+      if (content.targetedApproveCommand !== `/approve ${content.approvalId}`) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'approve command must match approvalId' });
+      }
+      if (content.targetedDenyCommand !== `/deny ${content.approvalId}`) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'deny command must match approvalId' });
+      }
+    }
+    if (content.status !== 'pending' && commands.some((command) => command !== undefined)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'completed approvals cannot carry commands' });
+    }
+  }),
+]);
+export type PhoneTextViewAgentContent = z.infer<typeof PhoneTextViewAgentContentSchema>;
+
 export const PhoneTextViewAgentBodySchema = z.object({
   role: z.literal('agent'),
-  content: z.object({ type: z.literal('text'), text: z.string().min(1) }),
+  content: PhoneTextViewAgentContentSchema,
 });
 export type PhoneTextViewAgentBody = z.infer<typeof PhoneTextViewAgentBodySchema>;
 
@@ -76,6 +125,33 @@ const RawLegacyAgentMessageSchema = z.object({
   content: z.object({ type: z.string() }).passthrough(),
 });
 
+/**
+ * Daemon-local control record emitted only by an ISCP session process. It is
+ * never written to the legacy Happy server. The record deliberately carries
+ * no provider arguments or call id. `approvalId` is a freshly generated,
+ * opaque correlation token with no provider semantics: a text grant may
+ * learn which card is waiting and answer exactly that card, but cannot inspect
+ * the internal agent-state protocol.
+ */
+export const RawPhoneApprovalBodySchema = z.object({
+  role: z.literal('happy-control'),
+  content: z.object({
+    type: z.literal('approval'),
+    approvalId: PhoneTextViewApprovalIdSchema,
+    toolName: z.string().min(1).max(160),
+    status: PhoneTextViewApprovalStatusSchema,
+  }),
+});
+export type RawPhoneApprovalBody = z.infer<typeof RawPhoneApprovalBodySchema>;
+
+export const RawPhoneApprovalResetBodySchema = z.object({
+  role: z.literal('happy-control'),
+  content: z.object({
+    type: z.literal('approval-reset'),
+    reason: z.literal('agent-restarted'),
+  }),
+});
+
 function drop(kind: string, dropReason: string): PhoneTextViewProjection {
   return { emit: null, kind, dropReason };
 }
@@ -95,6 +171,42 @@ export function projectPhoneTextView(rawBody: unknown): PhoneTextViewProjection 
         role: 'user',
         content: { type: 'text', text: user.data.content.text },
         ...(user.data.localKey !== undefined ? { localKey: user.data.localKey } : {}),
+      },
+    };
+  }
+
+  const approval = RawPhoneApprovalBodySchema.safeParse(rawBody);
+  if (approval.success) {
+    const { approvalId, toolName, status } = approval.data.content;
+    return {
+      kind: `phone-approval-${status}`,
+      emit: {
+        role: 'agent',
+        content: {
+          type: 'approval',
+          approvalId,
+          toolName,
+          status,
+          ...(status === 'pending'
+            ? {
+                approveCommand: '/approve' as const,
+                denyCommand: '/deny' as const,
+                targetedApproveCommand: `/approve ${approvalId}`,
+                targetedDenyCommand: `/deny ${approvalId}`,
+              }
+            : {}),
+        },
+      },
+    };
+  }
+
+  const approvalReset = RawPhoneApprovalResetBodySchema.safeParse(rawBody);
+  if (approvalReset.success) {
+    return {
+      kind: 'phone-approval-reset',
+      emit: {
+        role: 'agent',
+        content: { type: 'approval-reset', reason: 'agent-restarted' },
       },
     };
   }

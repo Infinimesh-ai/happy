@@ -8,7 +8,7 @@ import { TrackedSession, SessionEncryptionData } from './types';
 import { MachineMetadata, DaemonState, Metadata } from '@/api/types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 import { logger } from '@/ui/logger';
-import { authAndSetupMachineIfNeeded } from '@/ui/auth';
+import { resolveDaemonNetwork } from '@/iscp/networkStartup';
 import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
@@ -36,6 +36,7 @@ import {
   sanitizeSessionEnvironment,
   wrapTmuxCommandWithSessionEnvironmentSanitizer,
 } from './sessionEnvironment';
+import { startHappyTerminalDaemon } from './happyTerminalBoot';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -46,13 +47,11 @@ function appendDaemonSpawnModeArgs(args: string[], options: SpawnSessionOptions,
   if (agent !== 'claude' && agent !== 'codex') {
     return;
   }
-  // For claude, 'default' is the app's ambient "no override" value — forwarding
-  // it would pin the session to prompting mode and lose the CLI's own default
-  // (e.g. a --yolo setup where sessions must bypass permissions). For codex,
-  // 'default' IS a concrete ask-first mode (untrusted + workspace-write)
-  // distinct from the codex launch default ('yolo'), so it must be forwarded
-  // or the user's explicit ask-first pick silently yields a yolo session.
-  if (options.permissionMode && (agent === 'codex' || options.permissionMode !== 'default')) {
+  // 'default' is the app's "no override" value for every agent: it means run
+  // the harness the way it is already configured. Forwarding it would replace
+  // that configuration with one specific mode, which is the opposite of what
+  // the word promises. Each runner supplies its own launch default instead.
+  if (options.permissionMode && options.permissionMode !== 'default') {
     args.push('--permission-mode', options.permissionMode);
   }
   if (options.modelMode && options.modelMode !== 'default') {
@@ -178,15 +177,26 @@ export async function startDaemon(): Promise<void> {
   // 2. Should not have another daemon process running
 
   try {
+    // Happy Agent is a machine-level service shared by the mobile app and
+    // Happy Terminal. Start it concurrently and keep this daemon boot path
+    // independent from its install/download/network state.
+    startHappyTerminalDaemon();
+
     // Start caffeinate
     const caffeinateStarted = startCaffeinate();
     if (caffeinateStarted) {
       logger.debug('[DAEMON RUN] Sleep prevention enabled');
     }
 
-    // Ensure auth and machine registration BEFORE anything else
-    const { credentials, machineId } = await authAndSetupMachineIfNeeded();
-    logger.debug('[DAEMON RUN] Auth and machine setup complete');
+    // Network mode decision BEFORE anything else (OPS 2026-08-26 §4.1):
+    // legacy credentials → existing auth/machine setup verbatim; a healthy
+    // ISCP profile alone → ISCP-only boot with no legacy auth, machine
+    // registration, or Happy Server socket. Zero usable credentials → hard
+    // error (the daemon is headless and must never prompt).
+    const network = await resolveDaemonNetwork();
+    const machineId = network.machineId;
+    const legacyCredentials = network.mode === 'legacy' ? network.credentials : null;
+    logger.debug(`[DAEMON RUN] Network mode resolved: ${network.mode}`);
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
@@ -274,6 +284,15 @@ export async function startDaemon(): Promise<void> {
         };
         pidToTrackedSession.set(pid, trackedSession);
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
+      } else {
+        // Externally-started session re-reporting itself. ISCP-only sessions
+        // re-post this webhook on every metadata/agent-state change (their
+        // only state channel), so the tracked metadata must follow.
+        existingSession.happySessionMetadataFromLocalWebhook = sessionMetadata;
+        if (encryption) {
+          existingSession.encryption = encryption;
+        }
+        logger.debug(`[DAEMON RUN] Updated externally-started session ${sessionId} from webhook`);
       }
     };
 
@@ -686,9 +705,14 @@ export async function startDaemon(): Promise<void> {
     };
 
     const fetchServerSessionMetadata = async (sessionId: string, encryptionKey: Uint8Array, encryptionVariant: 'legacy' | 'dataKey'): Promise<Metadata | null> => {
+      if (!legacyCredentials) {
+        // ISCP-only: there is no server-side session directory to refresh
+        // from; resume falls back to the webhook-propagated metadata.
+        return null;
+      }
       try {
         const response = await axios.get(`${configuration.serverUrl}/v1/sessions`, {
-          headers: { Authorization: `Bearer ${credentials.token}` },
+          headers: { Authorization: `Bearer ${legacyCredentials.token}` },
           timeout: 10_000,
         });
         const sessions = (response.data as { sessions: { id: string; metadata: string }[] }).sessions;
@@ -737,10 +761,9 @@ export async function startDaemon(): Promise<void> {
         if (options?.model) {
           launch.args.push('--model', options.model);
         }
-        // Same as spawnSession: for claude, ambient 'default' must not
-        // override the CLI default; for codex, 'default' is a concrete
-        // ask-first mode and must be forwarded.
-        if (options?.permissionMode && (metadata.flavor === 'codex' || options.permissionMode !== 'default')) {
+        // Same as spawnSession: ambient 'default' must not override whatever
+        // the harness is already configured to do.
+        if (options?.permissionMode && options.permissionMode !== 'default') {
           launch.args.push('--permission-mode', options.permissionMode);
         }
 
@@ -778,11 +801,34 @@ export async function startDaemon(): Promise<void> {
           (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
 
           if (session.startedBy === 'daemon' && session.childProcess) {
-            try {
-              session.childProcess.kill('SIGTERM');
-              logger.debug(`[DAEMON RUN] Sent SIGTERM to daemon-spawned session ${sessionId}`);
-            } catch (error) {
-              logger.debug(`[DAEMON RUN] Failed to kill session ${sessionId}:`, error);
+            // Signal the whole process group, not just the Happy CLI parent.
+            // The harness runs its own backend as a grandchild — Codex spawns
+            // `codex app-server` (codexAppServerClient.ts:647) and only kills it
+            // from its own disconnect path, which a bare SIGTERM to the parent
+            // never reaches. Killing the parent alone therefore left the agent
+            // running, reparented and invisible. The daemon spawns with
+            // `detached: true` (see spawnSession above), which makes the parent
+            // a group leader, so the negative pid covers every descendant.
+            let signalled = false;
+            if (process.platform !== 'win32') {
+              try {
+                process.kill(-pid, 'SIGTERM');
+                signalled = true;
+                logger.debug(`[DAEMON RUN] Sent SIGTERM to process group of session ${sessionId}`);
+              } catch (error) {
+                logger.debug(`[DAEMON RUN] Group kill failed for session ${sessionId}, falling back:`, error);
+              }
+            }
+            // Windows has no process groups to signal, and a group kill can
+            // still fail if the child already exited or never led a group.
+            // Either way the parent is worth killing on its own.
+            if (!signalled) {
+              try {
+                session.childProcess.kill('SIGTERM');
+                logger.debug(`[DAEMON RUN] Sent SIGTERM to daemon-spawned session ${sessionId}`);
+              } catch (error) {
+                logger.debug(`[DAEMON RUN] Failed to kill session ${sessionId}:`, error);
+              }
             }
           } else {
             // For externally started sessions, try to kill by PID
@@ -843,7 +889,8 @@ export async function startDaemon(): Promise<void> {
       onHappySessionWebhook,
       iscp,
       reloadIscpPeers: () => iscpPeers.reload(),
-      getIscpPeerStatuses: () => iscpPeers.statuses()
+      getIscpPeerStatuses: () => iscpPeers.statuses(),
+      reopenIscpPeers: (profileId) => iscpPeers.reopen(profileId)
     });
 
     // Write initial daemon state (no lock needed for state file)
@@ -894,38 +941,47 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Bundle at ${bundlePath} not found; self-restart on upgrade disabled`);
     }
 
-    // Prepare initial daemon state
-    const initialDaemonState: DaemonState = {
-      status: 'offline',
-      pid: process.pid,
-      httpPort: controlPort,
-      startedAt: Date.now()
-    };
+    // Legacy machine registration + realtime socket — only with legacy
+    // credentials. ISCP-only daemons are reachable exclusively through the
+    // relay peers (wire machine.rpc bridges spawn/stop) and must not touch
+    // Happy Server auth, machine, or Socket.IO endpoints.
+    let apiMachine: ReturnType<ApiClient['machineSyncClient']> | null = null;
+    if (legacyCredentials) {
+      // Prepare initial daemon state
+      const initialDaemonState: DaemonState = {
+        status: 'offline',
+        pid: process.pid,
+        httpPort: controlPort,
+        startedAt: Date.now()
+      };
 
-    // Create API client
-    const api = await ApiClient.create(credentials);
+      // Create API client
+      const api = await ApiClient.create(legacyCredentials);
 
-    // Get or create machine
-    const machine = await api.getOrCreateMachine({
-      machineId,
-      metadata: initialMachineMetadata,
-      daemonState: initialDaemonState
-    });
-    logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
+      // Get or create machine
+      const machine = await api.getOrCreateMachine({
+        machineId,
+        metadata: initialMachineMetadata,
+        daemonState: initialDaemonState
+      });
+      logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
 
-    // Create realtime machine session
-    const apiMachine = api.machineSyncClient(machine);
+      // Create realtime machine session
+      apiMachine = api.machineSyncClient(machine);
 
-    // Set RPC handlers
-    apiMachine.setRPCHandlers({
-      spawnSession,
-      resumeSession,
-      stopSession,
-      requestShutdown: () => requestShutdown('happy-app')
-    });
+      // Set RPC handlers
+      apiMachine.setRPCHandlers({
+        spawnSession,
+        resumeSession,
+        stopSession,
+        requestShutdown: () => requestShutdown('happy-app')
+      });
 
-    // Connect to server
-    apiMachine.connect();
+      // Connect to server
+      apiMachine.connect();
+    } else {
+      logger.debug('[DAEMON RUN] ISCP-only: skipping legacy machine registration and Happy Server socket');
+    }
 
     // Every 60 seconds:
     // 1. Prune stale sessions
@@ -985,7 +1041,7 @@ export async function startDaemon(): Promise<void> {
         // leaving nothing running once we also exit.
         autoRenewal.stop();
         iscpPeers.stop();
-        apiMachine.shutdown();
+        apiMachine?.shutdown();
         await stopControlServer();
         await cleanupDaemonState();
         await releaseDaemonLock(daemonLockHandle);
@@ -1043,20 +1099,22 @@ export async function startDaemon(): Promise<void> {
         logger.debug('[DAEMON RUN] Health check interval cleared');
       }
 
-      // Update daemon state before shutting down
-      await apiMachine.updateDaemonState((state: DaemonState | null) => ({
-        ...state,
-        status: 'shutting-down',
-        shutdownRequestedAt: Date.now(),
-        shutdownSource: source
-      }));
+      // Update daemon state before shutting down (legacy socket only)
+      if (apiMachine) {
+        await apiMachine.updateDaemonState((state: DaemonState | null) => ({
+          ...state,
+          status: 'shutting-down',
+          shutdownRequestedAt: Date.now(),
+          shutdownSource: source
+        }));
 
-      // Give time for metadata update to send
-      await new Promise(resolve => setTimeout(resolve, 100));
+        // Give time for metadata update to send
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
 
       autoRenewal.stop();
       iscpPeers.stop();
-      apiMachine.shutdown();
+      apiMachine?.shutdown();
       await stopControlServer();
       await cleanupDaemonState();
       await stopCaffeinate();
@@ -1073,6 +1131,7 @@ export async function startDaemon(): Promise<void> {
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
+    console.error('Daemon startup failed:', error instanceof Error ? error.message : error);
     process.exit(1);
   }
 }

@@ -30,8 +30,8 @@ export type AgentDefaultConfig = {
 const codeAgentDefaults: Record<AgentKey, AgentDefaultConfig> = {
     // The Claude UI key for YOLO is `bypassPermissions`; the CLI also accepts
     // `yolo` and maps it to the Claude SDK's bypass mode.
-    claude: { permissionMode: 'bypassPermissions', modelMode: 'opus', effortLevel: 'medium' },
-    codex: { permissionMode: 'yolo', modelMode: 'gpt-5.5', effortLevel: 'medium' },
+    claude: { permissionMode: 'bypassPermissions', modelMode: 'claude-opus-5', effortLevel: 'medium' },
+    codex: { permissionMode: 'yolo', modelMode: 'gpt-5.6-sol', effortLevel: 'medium' },
     gemini: { permissionMode: 'default', modelMode: 'gemini-2.5-pro', effortLevel: null },
     openclaw: { permissionMode: 'default', modelMode: 'default', effortLevel: null },
     agy: { permissionMode: 'default', modelMode: 'Gemini 3.1 Pro (High)', effortLevel: null },
@@ -48,11 +48,34 @@ export function getCodeAgentDefaults(flavor: string | null | undefined): AgentDe
     return codeAgentDefaults[normalizeAgentKey(flavor)];
 }
 
+/**
+ * Permission keys that were offered once and are no longer accepted, mapped to
+ * what they meant. `dontAsk` never passed the CLI's message schema, so it was
+ * already dropped on the wire; it is retired here so a saved copy cannot make
+ * the composer show one mode while sending another.
+ */
+const RETIRED_PERMISSION_MODES: Record<string, string> = {
+    dontAsk: 'acceptEdits',
+};
+
+/**
+ * Maps a stored permission mode onto one the CLI still accepts. Applies to
+ * flavor-based agents only: a harness that publishes its own catalog owns its
+ * codes, and none of them collide with a retired Claude key.
+ */
+export function retirePermissionMode<T extends string | null | undefined>(mode: T): T | string {
+    return mode ? RETIRED_PERMISSION_MODES[mode] ?? mode : mode;
+}
+
 export function getAgentDefaultOverride(
     overrides: AgentDefaultOverrides | null | undefined,
     flavor: string | null | undefined,
 ): AgentDefaultOverride {
-    return overrides?.[normalizeAgentKey(flavor)] ?? {};
+    const override = overrides?.[normalizeAgentKey(flavor)] ?? {};
+    const permissionMode = retirePermissionMode(override.permissionMode);
+    return permissionMode === override.permissionMode
+        ? override
+        : { ...override, permissionMode };
 }
 
 export function resolveAgentDefaultConfig(

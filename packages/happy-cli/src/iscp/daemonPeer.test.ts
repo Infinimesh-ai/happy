@@ -34,6 +34,7 @@ describe('createIscpPeersController (single-flight reload)', () => {
       profiles,
       connectionStates: () => [],
       statuses: () => [],
+      reopen: () => ({ profiles: [] }),
       stop: () => {
         events.stops.push(runId)
       },
@@ -83,7 +84,7 @@ describe('createIscpPeersController (single-flight reload)', () => {
     const controller = createIscpPeersController(async () => {
       runs += 1
       if (runs === 1) throw new Error('relay down')
-      return { profiles: ['ok'], connectionStates: () => [], statuses: () => [], stop: () => { } }
+      return { profiles: ['ok'], connectionStates: () => [], statuses: () => [], reopen: () => ({ profiles: [] }), stop: () => { } }
     })
     await expect(controller.reload()).rejects.toThrowError(/relay down/)
     expect(controller.profiles()).toEqual([])

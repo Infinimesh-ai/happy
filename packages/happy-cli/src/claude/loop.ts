@@ -16,7 +16,8 @@ import type { PermissionMode } from "@/api/types"
 export type ClaudeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface EnhancedMode {
-    permissionMode: PermissionMode;
+    /** Unset means "no override" — Claude uses its own configured mode. */
+    permissionMode?: PermissionMode;
     model?: string;
     fallbackModel?: string;
     customSystemPrompt?: string;
@@ -35,7 +36,8 @@ interface LoopOptions {
     onModeChange: (mode: 'local' | 'remote') => void
     mcpServers: Record<string, any>
     session: ApiSessionClient
-    api: ApiClient,
+    /** null on ISCP-only sessions — legacy-server extras (push) are skipped. */
+    api: ApiClient | null,
     claudeEnvVars?: Record<string, string>
     claudeArgs?: string[]
     messageQueue: MessageQueue2<EnhancedMode>

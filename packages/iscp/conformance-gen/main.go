@@ -110,6 +110,7 @@ func main() {
 	genProvisioning(*out, meta)
 	genTrustGrant(*out, meta)
 	genAccessProof(*out, meta)
+	genV02(*out, meta)
 }
 
 func genJCS(out string, meta map[string]any) {

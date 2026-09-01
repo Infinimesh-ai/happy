@@ -11,13 +11,13 @@ import { FakeRelay } from './testing/fakeRelay';
 
 const provider = createNobleProvider();
 
-function makeGrant(issuer: Device, subject: Device, relayId: string): TrustGrant {
+function makeGrant(issuer: Device, subject: Device, relayId: string, audience = 'happy-domain'): TrustGrant {
   const unsigned = {
     type: TRUST_GRANT_TYPE,
     grant_id: `grant-${subject.identity.device_id}`,
     issuer: issuer.identity.device_id,
     subject_device_id: subject.identity.device_id,
-    audience: 'happy-domain',
+    audience,
     confirmation_thumbprint: identityThumbprint(provider, subject.identity),
     permissions: ['text', 'agent.capability.v1', 'happy-wire.v1'],
     relay_constraints: [relayId],
@@ -47,16 +47,36 @@ interface TestPeer {
   received: Array<{ from: string; payloadType: string; text: string }>;
   errors: unknown[];
   manifests: Array<{ from: string; manifest: unknown }>;
+  sessionDiagnostics: Array<{ event: string; cause?: string; attempt?: number; pendingCount?: number }>;
 }
 
-function createTestPeer(relay: FakeRelay, deviceId: string, identities: Map<string, DeviceIdentity>, issuer: Device): TestPeer {
-  const device = createDevice(provider, { domainId: relay.domainId, deviceId });
+function createTestPeer(
+  relay: FakeRelay,
+  deviceId: string,
+  identities: Map<string, DeviceIdentity>,
+  issuer: Device,
+  opts?: {
+    device?: Device;
+    grantAudience?: string;
+    onSessionReopen?: (cause: string) => void;
+    now?: () => Date;
+    handshakeTTLSeconds?: number;
+  },
+): TestPeer {
+  const device = opts?.device ?? createDevice(provider, { domainId: relay.domainId, deviceId });
   identities.set(deviceId, device.identity);
   const credentials = relay.issueCredentials(deviceId);
-  const result: TestPeer = { device, peer: undefined as unknown as IscpPeer, received: [], errors: [], manifests: [] };
+  const result: TestPeer = {
+    device,
+    peer: undefined as unknown as IscpPeer,
+    received: [],
+    errors: [],
+    manifests: [],
+    sessionDiagnostics: [],
+  };
   result.peer = new IscpPeer({
     device,
-    grant: makeGrant(issuer, device, relay.relayId),
+    grant: makeGrant(issuer, device, relay.relayId, opts?.grantAudience),
     relayDescriptor: relayDescriptor(relay),
     credentials,
     resolvePeerIdentity: async (id) => {
@@ -74,9 +94,20 @@ function createTestPeer(relay: FakeRelay, deviceId: string, identities: Map<stri
     onPeerReady: (from, manifest) => {
       result.manifests.push({ from, manifest });
     },
+    onSessionReopen: (request) => opts?.onSessionReopen?.(request.cause),
+    onSessionDiagnostic: (event) => result.sessionDiagnostics.push({
+      event: event.event,
+      ...(event.cause !== undefined ? { cause: event.cause } : {}),
+      ...(event.attempt !== undefined ? { attempt: event.attempt } : {}),
+      ...(event.pendingCount !== undefined ? { pendingCount: event.pendingCount } : {}),
+    }),
     onError: (error) => {
       result.errors.push(error);
     },
+    ...(opts?.handshakeTTLSeconds !== undefined
+      ? { handshakeTTLSeconds: opts.handshakeTTLSeconds }
+      : {}),
+    ...(opts?.now !== undefined ? { now: opts.now } : {}),
   });
   return result;
 }
@@ -90,6 +121,164 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000, what = 'condi
 }
 
 describe('IscpPeer over an in-memory relay', () => {
+  it('replaces a daemon-preserved Session after an authenticated phone process restart', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    let happy: TestPeer;
+    let reopenCount = 0;
+    let reopened: Promise<unknown> | undefined;
+    const phone = createTestPeer(relay, 'device-phone', identities, issuer);
+    happy = createTestPeer(relay, 'device-happy', identities, issuer, {
+      grantAudience: phone.device.identity.device_id,
+      onSessionReopen: () => {
+        reopenCount += 1;
+        happy.peer.closeSession(phone.device.identity.device_id);
+        reopened = happy.peer.openSession(phone.device.identity.device_id, { timeoutMs: 5000 });
+      },
+    });
+    phone.peer.start();
+    happy.peer.start();
+    let replacement: TestPeer | undefined;
+    try {
+      await waitFor(() => phone.peer.connectionState === 'READY' && happy.peer.connectionState === 'READY', 5000, 'initial transports');
+      await happy.peer.openSession(phone.device.identity.device_id, { timeoutMs: 5000 });
+      const oldSessionId = happy.peer.sessionStatus(phone.device.identity.device_id)?.sessionId;
+      expect(oldSessionId).toBeTruthy();
+
+      // Process replacement keeps the durable phone identity/key but drops
+      // every in-memory Session. The Happy peer/runtime remains untouched.
+      phone.peer.stop();
+      replacement = createTestPeer(relay, phone.device.identity.device_id, identities, issuer, {
+        device: phone.device,
+      });
+      replacement.peer.start();
+      await waitFor(() => replacement?.peer.connectionState === 'READY', 5000, 'replacement phone transport');
+      await replacement.peer.requestSessionReopen(happy.device.identity.device_id, 'runtime_started');
+      await waitFor(() => reopened !== undefined, 5000, 'Happy accepts reopen');
+      await reopened;
+      await waitFor(
+        () => replacement?.peer.sessionStatus(happy.device.identity.device_id)?.manifestExchanged === true,
+        5000,
+        'replacement phone manifest exchange',
+      );
+
+      const happySession = happy.peer.sessionStatus(phone.device.identity.device_id);
+      const phoneSession = replacement.peer.sessionStatus(happy.device.identity.device_id);
+      expect(reopenCount).toBe(1);
+      expect(happySession?.sessionId).toBe(phoneSession?.sessionId);
+      expect(happySession?.sessionId).not.toBe(oldSessionId);
+      expect(happySession?.ready).toBe(true);
+      expect(phoneSession?.manifestExchanged).toBe(true);
+      expect(happy.sessionDiagnostics.some((event) => event.event === 'reopen_accepted')).toBe(true);
+      expect(happy.sessionDiagnostics.some((event) => event.event === 'tombstone')).toBe(true);
+    } finally {
+      phone.peer.stop();
+      replacement?.peer.stop();
+      happy.peer.stop();
+    }
+  });
+
+  it('rejects a signed reopen when the sender is not the current Grant audience', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const authorizedPhone = createTestPeer(relay, 'device-phone', identities, issuer);
+    const rogue = createTestPeer(relay, 'device-rogue', identities, issuer);
+    let accepted = 0;
+    const happy = createTestPeer(relay, 'device-happy', identities, issuer, {
+      grantAudience: authorizedPhone.device.identity.device_id,
+      onSessionReopen: () => { accepted += 1; },
+    });
+    rogue.peer.start();
+    happy.peer.start();
+    try {
+      await waitFor(() => rogue.peer.connectionState === 'READY' && happy.peer.connectionState === 'READY', 5000, 'rogue transports');
+      await rogue.peer.requestSessionReopen(happy.device.identity.device_id, 'runtime_started');
+      await waitFor(() => happy.errors.length > 0, 5000, 'reopen rejection');
+      expect(accepted).toBe(0);
+      expect(happy.sessionDiagnostics.at(-1)).toMatchObject({ event: 'reopen_rejected' });
+    } finally {
+      authorizedPhone.peer.stop();
+      rogue.peer.stop();
+      happy.peer.stop();
+    }
+  });
+
+  it('never queues an expiring reopen control while the Relay is offline', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const phone = createTestPeer(relay, 'device-phone', identities, issuer);
+    phone.peer.start();
+    try {
+      await waitFor(() => phone.peer.connectionState === 'READY', 5000, 'phone transport');
+      relay.offline = true;
+      await expect(phone.peer.requestSessionReopen('device-happy', 'foreground_recovery')).rejects.toThrowError();
+      expect(phone.peer.pendingOutbound).toBe(0);
+    } finally {
+      relay.offline = false;
+      phone.peer.stop();
+    }
+  });
+
+  it('deduplicates a replayed authenticated reopen request', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const phone = createTestPeer(relay, 'device-phone', identities, issuer);
+    let accepted = 0;
+    const happy = createTestPeer(relay, 'device-happy', identities, issuer, {
+      grantAudience: phone.device.identity.device_id,
+      onSessionReopen: () => { accepted += 1; },
+    });
+    phone.peer.start();
+    happy.peer.start();
+    try {
+      await waitFor(() => phone.peer.connectionState === 'READY' && happy.peer.connectionState === 'READY', 5000, 'replay transports');
+      await phone.peer.requestSessionReopen(happy.device.identity.device_id, 'runtime_started');
+      await waitFor(() => accepted === 1, 5000, 'first reopen');
+      const envelope = relay.submitted.find((item) => item.payload_type === 'iscp.session.reopen.v1');
+      expect(envelope).toBeDefined();
+      relay.redeliver(envelope!);
+      await waitFor(
+        () => happy.sessionDiagnostics.some((event) => event.event === 'reopen_coalesced'),
+        5000,
+        'duplicate reopen diagnostic',
+      );
+      expect(accepted).toBe(1);
+    } finally {
+      phone.peer.stop();
+      happy.peer.stop();
+    }
+  });
+
+  it('rejects an expired otherwise-valid reopen request', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const phone = createTestPeer(relay, 'device-phone', identities, issuer, {
+      now: () => new Date('2026-01-01T00:00:00Z'),
+    });
+    let accepted = 0;
+    const happy = createTestPeer(relay, 'device-happy', identities, issuer, {
+      grantAudience: phone.device.identity.device_id,
+      onSessionReopen: () => { accepted += 1; },
+    });
+    phone.peer.start();
+    happy.peer.start();
+    try {
+      await waitFor(() => phone.peer.connectionState === 'READY' && happy.peer.connectionState === 'READY', 5000, 'expiry transports');
+      await phone.peer.requestSessionReopen(happy.device.identity.device_id, 'runtime_started');
+      await waitFor(() => happy.errors.length > 0, 5000, 'expired reopen rejection');
+      expect(accepted).toBe(0);
+      expect(happy.sessionDiagnostics.at(-1)).toMatchObject({ event: 'reopen_rejected' });
+    } finally {
+      phone.peer.stop();
+      happy.peer.stop();
+    }
+  });
+
   it('handshakes, exchanges manifests, and delivers payloads both ways', async () => {
     const relay = new FakeRelay();
     const identities = new Map<string, DeviceIdentity>();
@@ -259,6 +448,56 @@ describe('IscpPeer over an in-memory relay', () => {
     const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
     const alpha = createTestPeer(relay, 'device-alpha', identities, issuer);
     expect(() => alpha.peer.closeSession('device-never-seen')).not.toThrow();
+  });
+
+  it('bounds offline initial Hellos with short TTL and exposes lifecycle metrics', async () => {
+    const relay = new FakeRelay();
+    const identities = new Map<string, DeviceIdentity>();
+    const issuer = createDevice(provider, { domainId: relay.domainId, deviceId: 'trust-local-signer' });
+    const alpha = createTestPeer(relay, 'device-alpha', identities, issuer, { handshakeTTLSeconds: 35 });
+    createTestPeer(relay, 'device-beta', identities, issuer); // identity only; phone remains offline
+    alpha.peer.start();
+    try {
+      await waitFor(() => alpha.peer.connectionState === 'READY', 5000, 'alpha READY');
+      const first = alpha.peer.openSession('device-beta', { timeoutMs: 60_000 });
+      first.catch(() => { });
+      await waitFor(
+        () => relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE).length === 1,
+        5000,
+        'first short-lived hello',
+      );
+
+      const coalesced = alpha.peer.openSession('device-beta', { timeoutMs: 60_000 });
+      coalesced.catch(() => { });
+      await waitFor(
+        () => alpha.sessionDiagnostics.some((event) => event.event === 'hello_coalesced'),
+        5000,
+        'coalesced metric',
+      );
+      alpha.peer.closeSession('device-beta');
+      await expect(first).rejects.toMatchObject({ retryable: true });
+      await expect(coalesced).rejects.toMatchObject({ retryable: true });
+
+      const second = alpha.peer.openSession('device-beta', { timeoutMs: 60_000 });
+      second.catch(() => { });
+      await waitFor(
+        () => relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE).length === 2,
+        5000,
+        'replacement short-lived hello',
+      );
+      const hellos = relay.submitted.filter((e) => e.payload_type === SESSION_HELLO_TYPE);
+      expect(hellos.every((hello) => hello.route.ttl_seconds === 35)).toBe(true);
+      expect(alpha.sessionDiagnostics.some((event) => event.event === 'hello_attempt')).toBe(true);
+      expect(alpha.sessionDiagnostics.some((event) => event.event === 'hello_superseded')).toBe(true);
+      expect(alpha.sessionDiagnostics
+        .filter((event) => event.event === 'hello_attempt')
+        .at(-1)).toMatchObject({ attempt: 2, pendingCount: 2 });
+      expect(alpha.peer.pendingHelloCount('device-beta')).toBeLessThanOrEqual(2);
+      alpha.peer.closeSession('device-beta');
+      await expect(second).rejects.toMatchObject({ retryable: true });
+    } finally {
+      alpha.peer.stop();
+    }
   });
 
   it('converges on one session when a peer drains competing hellos from before and after closeSession', async () => {

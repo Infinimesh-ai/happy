@@ -231,4 +231,23 @@ describe('managed enrollment (Cloud v2 signed-ticket contract)', () => {
     expect(() => parseEnrollmentInput('!!!not-a-ticket!!!')).toThrowError()
     expect(() => parseEnrollmentInput('{"not":"a ticket"}')).toThrowError()
   })
+
+  it('rejects retired Cloud pair_… codes with the stable migration error, not an encoding error', () => {
+    for (const input of ['pair_abc123', '  pair_abc123  ', 'pair_']) {
+      let thrown: unknown
+      try {
+        parseEnrollmentInput(input)
+      } catch (error) {
+        thrown = error
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      expect((thrown as { code?: string }).code).toBe('legacy_pairing_code_unsupported')
+      const message = (thrown as Error).message
+      expect(message).toContain('legacy_pairing_code_unsupported')
+      expect(message).toContain('iscp.pairing_ticket.v2')
+      expect(message).not.toContain('invalid enrollment payload encoding')
+      // The raw code must never be echoed back (no secrets/codes in output contract).
+      expect(message).not.toContain('pair_abc123')
+    }
+  })
 })

@@ -18,7 +18,7 @@ export const en = {
     tabs: {
         // Tab navigation labels
         inbox: 'Inbox',
-        sessions: 'Terminals',
+        sessions: 'Sessions',
         settings: 'Settings',
     },
 
@@ -80,6 +80,7 @@ export const en = {
         offline: 'offline',
         lastSeen: ({ time }: { time: string }) => `last seen ${time}`,
         permissionRequired: 'permission required',
+        inputRequired: 'waiting for your answer',
         activeNow: 'Active now',
         unknown: 'unknown',
         unread: 'new results',
@@ -184,33 +185,14 @@ export const en = {
         displayDescription: 'Control layout and spacing',
         compactToolCalls: 'Compact Tool Calls',
         compactToolCallsDescription: 'Show non-interactive tool calls as one-line rows; open a row for details',
-        inlineToolCalls: 'Inline Tool Calls',
-        inlineToolCallsDescription: 'Display tool calls directly in chat messages',
-        expandTodoLists: 'Expand Todo Lists',
-        expandTodoListsDescription: 'Show all todos instead of just changes',
-        showLineNumbersInDiffs: 'Show Line Numbers in Diffs',
-        showLineNumbersInDiffsDescription: 'Display line numbers in code diffs',
         showLineNumbersInToolViews: 'Show Line Numbers in Tool Views',
         showLineNumbersInToolViewsDescription: 'Display line numbers in tool view diffs',
-        wrapLinesInDiffs: 'Wrap Lines in Diffs',
-        wrapLinesInDiffsDescription: 'Wrap long lines instead of horizontal scrolling in diff views',
-        diffStyle: 'Diff View',
-        diffStyleDescription: 'Show diffs as a single column (unified) or side-by-side (split). Split view is web-only.',
-        diffStyleOptions: {
-            unified: 'Unified',
-            split: 'Split',
-        },
         alwaysShowContextSize: 'Always Show Context Size',
         alwaysShowContextSizeDescription: 'Display context usage even when not near limit',
-        avatarStyle: 'Avatar Style',
-        avatarStyleDescription: 'Choose session avatar appearance',
-        avatarOptions: {
-            pixelated: 'Pixelated',
-            gradient: 'Gradient',
-            brutalist: 'Brutalist',
-        },
-        showFlavorIcons: 'Show AI Provider Icons',
-        showFlavorIconsDescription: 'Display AI provider icons on session avatars',
+        showHarnessIconInSessionHeader: 'Show Harness Icon in Session Header',
+        showHarnessIconInSessionHeaderDescription: 'Display the harness icon in the session header',
+        showHarnessIconsInSessionList: 'Show Harness Icons in Session List',
+        showHarnessIconsInSessionListDescription: 'Display harness icons on session-list avatars',
     },
 
     settingsFeatures: {
@@ -234,11 +216,6 @@ export const en = {
         hideInactiveSessionsSubtitle: 'Show only active chats in your list',
         groupToolCalls: 'Group Tool Calls',
         groupToolCallsSubtitle: 'Collapse consecutive tool calls into one container',
-        privacy: 'Privacy',
-        privacyDescription: 'Completely disables all analytics and telemetry. No data will be sent to PostHog or any other tracking service.',
-        disableAnalytics: 'Disable Analytics',
-        analyticsDisabled: 'All tracking and telemetry disabled',
-        analyticsEnabled: 'Anonymous usage analytics active',
         imageUpload: 'Image Upload',
         imageUploadSubtitle: 'Attach images to messages for supported agents to analyze',
     },
@@ -406,7 +383,6 @@ export const en = {
         resumeSessionSubtitle: 'Resume this session on the same machine',
         resumeSessionSameMachineOnly: 'This session can only be resumed on the same machine it started on.',
         resumeSessionMachineOffline: 'This machine is offline. Resume is only available while it is online.',
-        resumeSessionNeedsHappyAgent: 'Resume is unavailable on this machine. Run `happy-agent auth login` to enable it.',
         resumeSessionMissingMachine: 'This session is missing its machine metadata, so it cannot be resumed.',
         resumeSessionMissingBackendId: 'This session does not have a resumable Claude or Codex identifier.',
         resumeSessionUnexpectedDirectoryPrompt: 'Resume cannot create directories. Start the session manually from its original path.',
@@ -471,12 +447,21 @@ export const en = {
 
     agentInput: {
         permissionMode: {
+            // Modes are named with one untranslated word so they fit the
+            // composer chip; these strings describe them under that name.
             title: 'PERMISSION MODE',
-            default: 'default permissions',
-            acceptEdits: 'accept edits',
-            plan: 'plan',
+            // Not "never asks": auto still stops for a human, it just decides
+            // for itself when that is warranted.
+            auto: 'asks when unsure',
+            // Default sends no mode at all, so naming a behaviour here would be
+            // a guess about someone else's config.
+            default: 'harness setting',
+            agyDefault: 'agy sandbox',
+            openclawInert: 'not applied',
+            acceptEdits: 'edits, no asking',
+            plan: 'plan first',
             dontAsk: "don't ask",
-            bypassPermissions: 'yolo',
+            bypassPermissions: 'never asks',
             badgeAcceptAllEdits: 'accept all edits',
             badgeBypassAllPermissions: 'yolo',
             badgePlanMode: 'plan mode',
@@ -500,10 +485,15 @@ export const en = {
             readOnly: 'read-only',
             safeYolo: 'safe yolo',
             yolo: 'yolo',
-            defaultDescription: 'ask before untrusted commands',
+            defaultDescription: 'codex setting',
+            // Codex's own Auto preset: on-request approvals inside the
+            // workspace sandbox.
+            autoDescription: 'asks when unsure',
             readOnlyDescription: 'no writes',
-            safeYoloDescription: 'no prompts, workspace sandbox',
-            yoloDescription: 'no prompts, full access',
+            // Not "no prompts": shouldAutoApproveCodexApproval deliberately
+            // skips safe-yolo, so a sandbox escalation still reaches you.
+            safeYoloDescription: 'sandboxed, can escalate',
+            yoloDescription: 'full access',
             badgeReadOnly: 'read-only',
             badgeSafeYolo: 'safe yolo',
             badgeYolo: 'yolo',
@@ -520,10 +510,10 @@ export const en = {
         },
         geminiPermissionMode: {
             title: 'GEMINI PERMISSION MODE',
-            default: 'default permissions',
-            autoEdit: 'auto edit',
-            yolo: 'yolo',
-            plan: 'plan',
+            default: 'ask before every tool',
+            autoEdit: 'accept file edits',
+            yolo: 'never ask, full access',
+            plan: 'read only, plan first',
             badgeAutoEdit: 'auto edit',
             badgeYolo: 'yolo',
             badgePlan: 'plan',

@@ -38,6 +38,7 @@ function envelope(ev: Record<string, unknown>, extra: Record<string, unknown> = 
 }
 
 describe('projectPhoneTextView', () => {
+  const approvalId = '9cb4af5c-6e33-4f1a-8de5-d739f557820f';
   it('projects the production Codex seq 1–8 to exactly one user and one agent bubble', () => {
     const emitted = CODEX_SEQ_1_TO_8.map((body) => projectPhoneTextView(body)).filter(
       (projection) => projection.emit !== null,
@@ -82,6 +83,116 @@ describe('projectPhoneTextView', () => {
       kind: 'session-text',
       emit: { role: 'agent', content: { type: 'text', text: 'plain reply' } },
     });
+  });
+
+  it('projects correlated phone approval lifecycle records without provider arguments or call ids', () => {
+    const pending = projectPhoneTextView({
+      role: 'happy-control',
+      content: {
+        type: 'approval',
+        approvalId,
+        toolName: 'CodexBash',
+        status: 'pending',
+        arguments: { command: 'curl https://example.com' },
+        callId: 'internal-call-id',
+      },
+    });
+    expect(pending).toEqual({
+      kind: 'phone-approval-pending',
+      emit: {
+        role: 'agent',
+        content: {
+          type: 'approval',
+          approvalId,
+          toolName: 'CodexBash',
+          status: 'pending',
+          approveCommand: '/approve',
+          denyCommand: '/deny',
+          targetedApproveCommand: `/approve ${approvalId}`,
+          targetedDenyCommand: `/deny ${approvalId}`,
+        },
+      },
+    });
+    expect(JSON.stringify(pending)).not.toContain('example.com');
+    expect(JSON.stringify(pending)).not.toContain('internal-call-id');
+    expect(PhoneTextViewBodySchema.safeParse(pending.emit).success).toBe(true);
+
+    for (const status of ['approved', 'denied', 'cancelled'] as const) {
+      const completed = projectPhoneTextView({
+        role: 'happy-control',
+        content: { type: 'approval', approvalId, toolName: 'CodexBash', status },
+      });
+      expect(completed).toEqual({
+        kind: `phone-approval-${status}`,
+        emit: {
+          role: 'agent',
+          content: { type: 'approval', approvalId, toolName: 'CodexBash', status },
+        },
+      });
+      expect(PhoneTextViewBodySchema.safeParse(completed.emit).success).toBe(true);
+    }
+  });
+
+  it('rejects malformed approval cards at the phone-view schema boundary', () => {
+    expect(PhoneTextViewBodySchema.safeParse({
+      role: 'agent',
+      content: { type: 'approval', approvalId, toolName: 'Bash', status: 'pending' },
+    }).success).toBe(false);
+    expect(PhoneTextViewBodySchema.safeParse({
+      role: 'agent',
+      content: {
+        type: 'approval',
+        approvalId,
+        toolName: 'Bash',
+        status: 'approved',
+        approveCommand: '/approve',
+        denyCommand: '/deny',
+      },
+    }).success).toBe(false);
+    expect(PhoneTextViewBodySchema.safeParse({
+      role: 'agent',
+      content: {
+        type: 'approval',
+        approvalId,
+        toolName: 'Bash',
+        status: 'pending',
+        approveCommand: '/approve',
+        denyCommand: '/deny',
+        targetedApproveCommand: '/approve 3fba23a7-ed9e-48d7-96cf-0588dd678a67',
+        targetedDenyCommand: `/deny ${approvalId}`,
+      },
+    }).success).toBe(false);
+  });
+
+  it('drops legacy uncorrelated approval records when rebuilding the v3 view', () => {
+    const projection = projectPhoneTextView({
+      role: 'happy-control',
+      content: { type: 'approval', toolName: 'CodexBash', status: 'pending' },
+    });
+    expect(projection.emit).toBeNull();
+    expect(projection.kind).toBe('unknown');
+  });
+
+  it('projects an agent restart boundary without exposing process metadata', () => {
+    const projection = projectPhoneTextView({
+      role: 'happy-control',
+      content: {
+        type: 'approval-reset',
+        reason: 'agent-restarted',
+        pid: 1234,
+        internalSession: 'do-not-leak',
+      },
+    });
+    expect(projection).toEqual({
+      kind: 'phone-approval-reset',
+      emit: {
+        role: 'agent',
+        content: { type: 'approval-reset', reason: 'agent-restarted' },
+      },
+    });
+    expect(JSON.stringify(projection)).not.toContain('1234');
+    expect(JSON.stringify(projection)).not.toContain('do-not-leak');
+    expect(PhoneTextViewBodySchema.safeParse(projection.emit).success).toBe(true);
   });
 
   it('drops thinking text', () => {

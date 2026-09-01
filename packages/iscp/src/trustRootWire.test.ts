@@ -160,15 +160,46 @@ describe('trust read plane wire contract (ISCP reference shapes)', () => {
     expect(new URL(calls[0]!).searchParams.has('domain_id')).toBe(false);
   });
 
-  it('grantStatus accepts the reference bare grant', async () => {
-    const client = referenceClient({ '/v2/trust/grants/status': cloudGrant }, []);
-    expect(await client.grantStatus('grant_happy1')).toEqual(cloudGrant);
+  // ISCP v0.2: the reference implementation emits the same normative typed
+  // shapes as the Cloud; the pre-v0.2 bare grant and epoch map are rejected
+  // rather than silently bridged.
+  it('grantStatus accepts the v0.2 typed envelope and rejects the pre-v0.2 bare grant', async () => {
+    const typed = referenceClient({ '/v2/trust/grants/status': { type: 'iscp.trust.grant_status.v2', grant: cloudGrant, status: 'active' } }, []);
+    expect(await typed.grantStatus('grant_happy1')).toEqual(cloudGrant);
+    const bare = referenceClient({ '/v2/trust/grants/status': cloudGrant }, []);
+    await expect(bare.grantStatus('grant_happy1')).rejects.toThrowError();
   });
 
-  it('revocations passes the reference epoch map through untouched', async () => {
+  it('revocations rejects the pre-v0.2 epoch map', async () => {
+    const client = referenceClient({ '/v2/trust/revocations': { dev_a: 2, dev_b: 1 } }, []);
+    await expect(client.revocations()).rejects.toThrowError();
+  });
+
+  it('revocations follows next_cursor pages to exhaustion', async () => {
     const calls: string[] = [];
-    const client = referenceClient({ '/v2/trust/revocations': { dev_a: 2, dev_b: 1 } }, calls);
-    expect(await client.revocations()).toEqual({ dev_a: 2, dev_b: 1 });
-    expect(calls[0]!.endsWith('/v2/trust/revocations')).toBe(true);
+    const pages = [
+      {
+        type: 'iscp.trust.revocations.v2',
+        items: [{ revocation_id: 'rev_1', domain_id: 'dom_prod', device_id: 'dev_a', reason_code: 'device_compromised', effective_at: '2026-08-01T08:30:00Z' }],
+        next_cursor: 'cursor_page2',
+      },
+      {
+        type: 'iscp.trust.revocations.v2',
+        items: [{ revocation_id: 'rev_2', domain_id: 'dom_prod', device_id: 'dev_b', reason_code: 'device_lost', effective_at: '2026-08-01T09:30:00Z' }],
+      },
+    ];
+    const client = new TrustRootClient({
+      baseUrl: 'http://localhost:18081',
+      trustRootId: 'trust-root-local',
+      provider,
+      fetchImpl: async (url: string) => {
+        calls.push(url);
+        const body = pages[calls.length - 1];
+        return { ok: true, status: 200, json: async (): Promise<unknown> => body, text: async () => JSON.stringify(body) };
+      },
+    });
+    expect(await client.revocations()).toEqual({ dev_a: 1, dev_b: 1 });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.endsWith('?cursor=cursor_page2')).toBe(true);
   });
 });

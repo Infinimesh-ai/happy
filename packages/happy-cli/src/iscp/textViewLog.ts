@@ -8,8 +8,8 @@
  * the phone cursor.
  *
  * Layout (next to the raw files, under sessions/<sessionId>/):
- *   textview.v1.jsonl       one projected record per line
- *   textview.v1.meta.json   { viewEpoch, lastViewSeq, rawWatermark, rawEpoch }
+ *   textview.v3.jsonl       one projected record per line
+ *   textview.v3.meta.json   { viewEpoch, lastViewSeq, rawWatermark, rawEpoch }
  *
  * Invariants:
  * - projection is the single pure projector from @slopus/happy-wire
@@ -109,11 +109,11 @@ export class TextViewLog {
   }
 
   private viewFile(sessionId: string): string {
-    return join(this.sessionDir(sessionId), 'textview.v1.jsonl')
+    return join(this.sessionDir(sessionId), 'textview.v3.jsonl')
   }
 
   private metaFile(sessionId: string): string {
-    return join(this.sessionDir(sessionId), 'textview.v1.meta.json')
+    return join(this.sessionDir(sessionId), 'textview.v3.meta.json')
   }
 
   private writeMeta(sessionId: string, state: TextViewState): void {
@@ -202,7 +202,11 @@ export class TextViewLog {
             kind: projection.kind,
             emitted: true,
             viewSeq: record.viewSeq,
-            textLength: projection.emit.content.text.length,
+            textLength: 'text' in projection.emit.content
+              ? projection.emit.content.text.length
+              : 'toolName' in projection.emit.content && typeof projection.emit.content.toolName === 'string'
+                ? projection.emit.content.toolName.length
+                : 0,
           })
         } else {
           this.onProjection?.({

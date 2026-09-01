@@ -29,10 +29,12 @@ import {
   type SessionWireEvent,
 } from '@slopus/happy-wire'
 import {
+  IscpErrorCodes,
   IscpPeer,
   RelayHttpClient,
   TrustRootClient,
   createNobleProvider,
+  iscpError,
   verifyRelayDescriptor,
   verifyTrustRootDescriptor,
   utf8Decode,
@@ -43,7 +45,11 @@ import {
 import { logger } from '@/ui/logger'
 import { listProfiles, readProfileBundle, readProfileDevice, updateProfileCredentials } from '@/iscp/enrollment'
 import { recoverProfileCredentialsNow } from '@/iscp/credentialRecovery'
-import { startSessionInitiator, type ProfilePeerStatus, type ProfileSessionState } from '@/iscp/sessionInitiator'
+import {
+  startSessionInitiator,
+  type ProfilePeerStatus,
+  type ProfileSessionState,
+} from '@/iscp/sessionInitiator'
 import type { DaemonIscpService, SessionEventNotification, SessionLifecycleNotification, TextViewEventNotification } from '@/iscp/daemonIscp'
 import { WireResponder, type WireResponderDeps } from '@/iscp/wireResponder'
 
@@ -56,12 +62,15 @@ export interface DaemonIscpPeers {
   connectionStates: () => string[]
   /** Full per-profile diagnostics (transport + session layers). */
   statuses: () => ProfilePeerStatus[]
+  /** Trigger a bounded fresh Session for one profile, or every ready profile. */
+  reopen: (profileId?: string) => { profiles: string[] }
   stop: () => void
 }
 
 interface ProfilePeerHandle {
   profileId: string
   status: () => ProfilePeerStatus
+  reopen: () => boolean
   stop: () => void
 }
 
@@ -87,6 +96,16 @@ export async function startDaemonIscpPeers(
     profiles: handles.map((handle) => handle.profileId),
     connectionStates: () => handles.map((handle) => handle.status().connectionState),
     statuses: () => handles.map((handle) => handle.status()),
+    reopen: (profileId) => {
+      const targets = profileId === undefined
+        ? handles
+        : handles.filter((handle) => handle.profileId === profileId)
+      return {
+        profiles: targets
+          .filter((handle) => handle.reopen())
+          .map((handle) => handle.profileId),
+      }
+    },
     stop: () => {
       for (const handle of handles) handle.stop()
     },
@@ -125,6 +144,11 @@ async function startProfilePeer(
   const view = wireViewForPermissions(bundle.trust_grant.permissions)
   const responder = new WireResponder({ ...deps, profileId, view })
   const subscribedPeers = new Set<string>()
+  let requestSessionReopen: ((cause: string) => boolean) | undefined
+  let sessionReopenCoalesceCount = 0
+  let helloAttemptCount = 0
+  let helloSupersededCount = 0
+  let helloCoalescedCount = 0
 
   const peer: IscpPeer = new IscpPeer({
     device,
@@ -138,7 +162,21 @@ async function startProfilePeer(
     // silent socket is dead after seconds, not the generic 60s default —
     // keep the daemon reachable across app reconnects.
     wsBackoff: { idleTimeoutMs: 15_000 },
-    resolvePeerIdentity: async (deviceId) => (await trustRoot.deviceStatus(deviceId)).identity,
+    // The control phone may be offline while this daemon remains healthy.
+    // Keep public handshakes short-lived so Relay drain cannot replay minutes
+    // of obsolete initial attempts when the phone returns.
+    handshakeTTLSeconds: 35,
+    resolvePeerIdentity: async (deviceId) => {
+      const record = await trustRoot.deviceStatus(deviceId)
+      const status = record.status.toLowerCase()
+      if (status === 'revoked') {
+        throw iscpError(IscpErrorCodes.TrustInvalid, 'peer device has been revoked')
+      }
+      if (status !== 'authorized' && status !== 'trusted') {
+        throw iscpError(IscpErrorCodes.TrustInvalid, 'peer device is not currently trusted')
+      }
+      return record.identity
+    },
     manifest: defaultAgentCapabilityManifest(),
     provider,
     onCredentialsRotated: (credentials) => {
@@ -176,6 +214,30 @@ async function startProfilePeer(
     },
     onPeerReady: (peerDeviceId) => {
       logger.debug(`[ISCP PEER] app peer ready: ${peerDeviceId} (profile ${profileId})`)
+    },
+    onSessionReopen: (request) => {
+      const cause = `peer_${request.cause}`
+      const accepted = requestSessionReopen?.(cause) ?? false
+      if (!accepted) sessionReopenCoalesceCount += 1
+      logger.debug('[ISCP PEER] authenticated Session reopen received', {
+        profileId,
+        peerDeviceId: request.device_id,
+        cause: request.cause,
+        accepted,
+        coalesceCount: sessionReopenCoalesceCount,
+      })
+    },
+    onSessionDiagnostic: (event) => {
+      if (event.event === 'reopen_coalesced') sessionReopenCoalesceCount += 1
+      if (event.event === 'hello_attempt') helloAttemptCount += 1
+      if (event.event === 'hello_superseded') helloSupersededCount += 1
+      if (event.event === 'hello_coalesced') helloCoalescedCount += 1
+      const { pendingCount, ...metadata } = event
+      logger.debug('[ISCP PEER] Session lifecycle', {
+        profileId,
+        ...metadata,
+        ...(pendingCount !== undefined ? { pending_count: pendingCount } : {}),
+      })
     },
     onPayload: (peerDeviceId, payloadType, plaintext) => {
       if (payloadType !== WIRE_REQUEST_PAYLOAD_TYPE) return
@@ -295,9 +357,14 @@ async function startProfilePeer(
   const audience = bundle.trust_grant.audience
   let sessionState: ProfileSessionState = 'connecting'
   let sessionDetail: string | undefined
+  let sessionAttempt = 0
+  let sessionReopenCount = 0
   const initiator = startSessionInitiator({
     peerDeviceId: audience,
-    openSession: (peerDeviceId, opts) => peer.openSession(peerDeviceId, opts),
+    openSession: (peerDeviceId, opts) => {
+      sessionAttempt += 1
+      return peer.openSession(peerDeviceId, opts)
+    },
     closeSession: (peerDeviceId) => peer.closeSession(peerDeviceId),
     grantExpiresAt: () => new Date(bundle.trust_grant.expires_at),
     onState: (state, detail) => {
@@ -305,19 +372,65 @@ async function startProfilePeer(
       sessionDetail = detail
     },
     log: (line) => logger.debug(`[ISCP PEER] ${profileId}: ${line}`),
+    // Managed profiles rotate only from the authenticated phone control
+    // signal (or the local control endpoint), never from idle time alone.
+    superviseReopen: true,
+    // Paired with the 35-second Hello TTL: at most the current and boundary
+    // attempt can still be valid at the Relay, with <=30s reconnect latency.
+    timeoutMs: 30_000,
+    sessionStatus: () => {
+      const current = peer.sessionStatus(audience)
+      if (!current) return undefined
+      return {
+        sessionId: current.sessionId,
+        role: current.role,
+        ...(current.lastAuthenticatedAt !== undefined ? { lastAuthenticatedAt: current.lastAuthenticatedAt } : {}),
+      }
+    },
+    onBeforeReopen: (cause, previous) => {
+      sessionReopenCount += 1
+      subscribedPeers.delete(audience)
+      logger.debug('[ISCP PEER] session reopening', {
+        profileId,
+        peerDeviceId: audience,
+        cause,
+        sessionId: previous?.sessionId,
+        role: previous?.role,
+        lastVerifiedAt: previous?.lastAuthenticatedAt,
+        attempt: sessionAttempt,
+        reopenCount: sessionReopenCount,
+      })
+    },
   })
+  requestSessionReopen = (cause) => initiator.requestReopen(cause)
 
   return {
     profileId,
-    status: () => ({
-      profileId,
-      deviceId: device.identity.device_id,
-      generation: bundle.generation ?? 1,
-      connectionState: peer.connectionState,
-      session: sessionState,
-      ...(sessionDetail !== undefined ? { sessionDetail } : {}),
-      peerDeviceId: audience,
-    }),
+    status: () => {
+      const current = peer.sessionStatus(audience)
+      return {
+        profileId,
+        deviceId: device.identity.device_id,
+        generation: bundle.generation ?? 1,
+        connectionState: peer.connectionState,
+        session: sessionState,
+        ...(sessionDetail !== undefined ? { sessionDetail } : {}),
+        peerDeviceId: audience,
+        ...(current !== undefined ? {
+          sessionId: current.sessionId,
+          sessionRole: current.role,
+          ...(current.lastAuthenticatedAt !== undefined ? { sessionLastVerifiedAt: current.lastAuthenticatedAt } : {}),
+        } : {}),
+        sessionAttempt,
+        sessionReopenCount,
+        sessionReopenCoalesceCount,
+        helloAttemptCount,
+        helloSupersededCount,
+        helloCoalescedCount,
+        pendingCount: peer.pendingHelloCount(audience),
+      }
+    },
+    reopen: () => initiator.requestReopen('controlled_reopen'),
     stop: () => {
       initiator.stop()
       // Settle any pending openSession so the loop terminates promptly.
@@ -345,6 +458,8 @@ export interface IscpPeersController {
   profiles: () => string[]
   statuses: () => ProfilePeerStatus[]
   connectionStates: () => string[]
+  /** Request a fresh Session without replacing the peer runtime or identity. */
+  reopen: (profileId?: string) => { profiles: string[] }
   stop: () => void
 }
 
@@ -383,6 +498,7 @@ export function createIscpPeersController(start: () => Promise<DaemonIscpPeers>)
     profiles: () => current?.profiles ?? [],
     statuses: () => current?.statuses() ?? [],
     connectionStates: () => current?.connectionStates() ?? [],
+    reopen: (profileId) => current?.reopen(profileId) ?? { profiles: [] },
     stop: () => {
       current?.stop()
       current = null

@@ -9,7 +9,9 @@ import { DiffProcessor } from './utils/diffProcessor';
 import { randomUUID } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { logger } from '@/ui/logger';
-import { Credentials, readSettings } from '@/persistence';
+import { readSettings } from '@/persistence';
+import type { SessionNetwork } from '@/iscp/networkStartup';
+import { createIscpOnlySession } from '@/iscp/iscpOnlySession';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
@@ -28,9 +30,10 @@ import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler"
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { PermissionMode } from '@/api/types';
-import type { ApiSessionClient } from '@/api/apiSession';
+import { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy, shouldAutoApproveCodexApproval } from './executionPolicy';
 import {
+    describeCodexFailure,
     mapCodexMcpMessageToSessionEnvelopes,
     mapCodexProcessorMessageToSessionEnvelopes,
 } from './utils/sessionProtocolMapper';
@@ -55,21 +58,6 @@ import {
     type CodexGoalCommand,
 } from './codexGoalStatus';
 
-/**
- * Extracts a human-readable error from a codex task_complete/turn_aborted event.
- * Returns null if the event represents a successful/clean completion.
- */
-function describeCodexFailure(msg: any): string | null {
-    const hasFailure = msg?.status === 'failed' || (msg?.error !== undefined && msg?.error !== null);
-    if (!hasFailure) return null;
-    const err = msg.error;
-    if (typeof err === 'string' && err.length > 0) return err;
-    if (err && typeof err === 'object' && typeof err.message === 'string' && err.message.length > 0) {
-        return err.message;
-    }
-    return 'Unknown error';
-}
-
 function hasCodexSubagentReference(message: Record<string, unknown>): boolean {
     for (const key of ['subagent', 'parent_call_id', 'parentCallId', 'agent_thread_id', 'agentThreadId']) {
         const value = message[key];
@@ -80,15 +68,21 @@ function hasCodexSubagentReference(message: Record<string, unknown>): boolean {
     return false;
 }
 
-const DEFAULT_CODEX_MODEL = 'gpt-5.5';
+const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
-const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
+// Codex's app-server protocol requires a concrete approval policy and sandbox
+// on every turn, so unlike Claude there is no "send nothing" here. This is the
+// closest honest equivalent: `auto` is Codex's own shipped default preset
+// (on-request approvals inside the workspace sandbox), so leaving the picker on
+// Default lands where plain `codex` would. It used to be 'yolo', which quietly
+// gave full access to anyone who never touched the picker.
+const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'auto';
 
 /**
  * Main entry point for the codex command with ink UI
  */
 export async function runCodex(opts: {
-    credentials: Credentials;
+    network: SessionNetwork;
     startedBy?: 'daemon' | 'terminal';
     noSandbox?: boolean;
     resumeThreadId?: string;
@@ -122,7 +116,11 @@ export async function runCodex(opts: {
     // Set backend for offline warnings (before any API calls)
     connectionState.setBackend('Codex');
 
-    const api = await ApiClient.create(opts.credentials);
+    // ISCP-only sessions (OPS 2026-08-26 §4.1) never construct a Happy
+    // Server client — no auth, no machine row, no session socket.
+    const api: ApiClient | null = opts.network.mode === 'legacy'
+        ? await ApiClient.create(opts.network.credentials)
+        : null;
 
     // Log startup options
     logger.debug(`[codex] Starting with options: startedBy=${opts.startedBy || 'terminal'}`);
@@ -139,10 +137,12 @@ export async function runCodex(opts: {
         process.exit(1);
     }
     logger.debug(`Using machineId: ${machineId}`);
-    await api.getOrCreateMachine({
-        machineId,
-        metadata: initialMachineMetadata
-    });
+    if (api) {
+        await api.getOrCreateMachine({
+            machineId,
+            metadata: initialMachineMetadata
+        });
+    }
 
     //
     // Create session
@@ -192,8 +192,13 @@ export async function runCodex(opts: {
             agentState: state,
             agentStateVersion: parseInt(reconnectAgentStateVersion || '0', 10),
         };
-    } else {
+    } else if (api) {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+    } else {
+        // ISCP-only: the session identity is minted locally — the daemon event
+        // log and RPC registry treat ids as opaque, and there is no server row.
+        response = createIscpOnlySession(metadata, state);
+        logger.debug(`[START] Minted ISCP-only session ${response.id}`);
     }
 
     // Handle server unreachable case - create offline stub with hot reconnection
@@ -204,21 +209,30 @@ export async function runCodex(opts: {
     let client!: CodexAppServerClient;
     let reasoningProcessor!: ReasoningProcessor;
     let abortInProgress: Promise<void> | null = null;
-    const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
-        api,
-        sessionTag,
-        metadata,
-        state,
-        response,
-        onSessionSwap: (newSession) => {
-            session = newSession;
-            // Update permission handler with new session to avoid stale reference
-            if (permissionHandler) {
-                permissionHandler.updateSession(newSession);
+    let reconnectionHandle: ReturnType<typeof setupOfflineReconnection>['reconnectionHandle'] = null;
+    if (api) {
+        const offlineSetup = setupOfflineReconnection({
+            api,
+            sessionTag,
+            metadata,
+            state,
+            response,
+            onSessionSwap: (newSession) => {
+                session = newSession;
+                // Update permission handler with new session to avoid stale reference
+                if (permissionHandler) {
+                    permissionHandler.updateSession(newSession);
+                }
             }
-        }
-    });
-    session = initialSession;
+        });
+        session = offlineSetup.session;
+        reconnectionHandle = offlineSetup.reconnectionHandle;
+    } else {
+        // ISCP-only: no Happy Server socket/outbox — history goes to the
+        // daemon event log, inbound RPC over the localhost bridge. There is
+        // no "offline" state to reconnect from.
+        session = new ApiSessionClient(null, response!);
+    }
 
     // On reconnect, un-archive the session and skip replaying old messages.
     if (reconnectSessionId) {
@@ -308,13 +322,15 @@ export async function runCodex(opts: {
     ];
 
     const VALID_REMOTE_EFFORTS: readonly ReasoningEffort[] = [
-        'none', 'minimal', 'low', 'medium', 'high', 'xhigh',
+        'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
     ];
 
     const handleUserMessage = createSerialAsyncHandler<UserMessage>(async (message) => {
-        const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
-
         // Resolve permission mode (validate against Codex-native modes)
+        // before consuming text-only approval commands. This lets the phone's
+        // "approve and enable YOLO" action update the live turn policy and
+        // resolve the current request atomically; later approvals in that
+        // same turn then observe the explicitly selected YOLO mode.
         let messagePermissionMode = currentPermissionMode;
         if (message.meta?.permissionMode) {
             const incoming = message.meta.permissionMode as PermissionMode;
@@ -329,6 +345,12 @@ export async function runCodex(opts: {
         } else {
             logger.debug(`[Codex] User message received with no permission mode override, using current: ${currentPermissionMode ?? 'default (effective)'}`);
         }
+
+        if (permissionHandler.tryHandleTextPermissionResponse(message.content.text)) {
+            return;
+        }
+
+        const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
 
         // Resolve model; explicit null resets to default (undefined)
         let messageModel = currentModel;
@@ -409,7 +431,7 @@ export async function runCodex(opts: {
     const sendReady = () => {
         session.sendSessionEvent({ type: 'ready' });
         try {
-            api.push().sendSessionNotification({
+            api?.push().sendSessionNotification({
                 kind: 'done',
                 metadata: session.getMetadata(),
                 data: {
@@ -598,7 +620,16 @@ export async function runCodex(opts: {
 
     client = new CodexAppServerClient(sandboxConfig);
 
-    permissionHandler = new CodexPermissionHandler(session);
+    permissionHandler = new CodexPermissionHandler(session, {
+        announceTextApprovals: api === null,
+    });
+    // A previous process may have died before it could emit terminal events
+    // for its in-memory approvals. The v3 phone view treats this marker as a
+    // generation boundary and closes every still-pending card from that
+    // earlier process before accepting new approvals.
+    if (api === null) {
+        session.sendPhoneApprovalReset();
+    }
     // Drop any permission requests left in agent state from a previous CLI
     // process that died while a tool prompt was open — see the matching
     // call in claudeRemoteLauncher for the full rationale.

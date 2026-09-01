@@ -14,7 +14,7 @@
   "meta": {
     "generator": "packages/iscp/conformance-gen",
     "note": "deterministic fixtures; private keys here are shared test material, not credentials",
-    "pin": "413d767bd8b47a8c6b7430115bf60dc283aebbc0"
+    "pin": "fa1d493c278f13e3588ad173c19695c9f5b9ec2d"
   },
   "proof": {
     "audience": "relay-local",

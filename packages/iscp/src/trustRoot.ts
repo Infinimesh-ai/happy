@@ -24,7 +24,16 @@ import {
   type TrustRootDescriptor,
 } from './schemas';
 
+/**
+ * ISCP v0.2 normative read shapes (spec/trust-root.md,
+ * schemas/json/trust.*.v2.json): the union parsing that once bridged the
+ * reference implementation and managed Cloud deployments is gone — both now
+ * emit these typed responses. The `type` discriminators are validated when
+ * present but tolerated when absent so the migration window's untyped
+ * emissions keep parsing.
+ */
 export const TrustDeviceRecordSchema = z.object({
+  type: z.literal('iscp.trust.device_status.v2').optional(),
   identity: DeviceIdentitySchema,
   status: z.enum(['submitted', 'authorized', 'revoked']).or(z.string()),
   device_record_version: z.number().int().min(0),
@@ -32,14 +41,8 @@ export const TrustDeviceRecordSchema = z.object({
 });
 export type TrustDeviceRecord = z.infer<typeof TrustDeviceRecordSchema>;
 
-/**
- * Managed trust roots (Infinimesh Cloud, slice 20 frozen wire contract) wrap
- * the grant-status response in an envelope instead of the reference's bare
- * grant, and serve revocations as an `items` list instead of the reference's
- * device-id → epoch map. The client accepts both shapes so one parser covers
- * the ISCP reference stack and managed Cloud deployments.
- */
 const GrantStatusEnvelopeSchema = z.object({
+  type: z.literal('iscp.trust.grant_status.v2').optional(),
   grant: TrustGrantSchema,
   status: z.enum(['active', 'revoked', 'expired']),
 });
@@ -52,8 +55,11 @@ const RevocationItemSchema = z.object({
   reason_code: z.string(),
   effective_at: z.string(),
 });
-const RevocationListSchema = z.object({ items: z.array(RevocationItemSchema) });
-const RevocationEpochMapSchema = z.record(z.string(), z.number().int().min(0));
+const RevocationListSchema = z.object({
+  type: z.literal('iscp.trust.revocations.v2').optional(),
+  items: z.array(RevocationItemSchema),
+  next_cursor: z.string().min(1).optional(),
+});
 
 export interface VerifyGrantOptions {
   audience: string;
@@ -270,38 +276,42 @@ export class TrustRootClient {
   /**
    * GET /v2/trust/grants/status?grant_id=...[&domain_id=...]
    *
-   * Accepts the reference's bare grant and the managed `{grant, status}`
-   * envelope; the strict grant schema keeps the two unambiguous.
+   * ISCP v0.2 iscp.trust.grant_status.v2 envelope; the lifecycle status is
+   * `active | revoked | expired` with revoked winning over expired.
    */
   async grantStatus(grantId: string): Promise<TrustGrant> {
     const response = await this.fetchImpl(`${this.baseUrl}/v2/trust/grants/status?grant_id=${encodeURIComponent(grantId)}${this.domainQuery('&')}`);
     if (!response.ok) await parseError(response, 'grant status');
-    const body = z.union([GrantStatusEnvelopeSchema, TrustGrantSchema]).parse(await response.json());
-    return 'grant' in body ? body.grant : body;
+    return GrantStatusEnvelopeSchema.parse(await response.json()).grant;
   }
 
   /**
-   * GET /v2/trust/revocations[?domain_id=...] — device id → revocation epoch.
-   *
-   * Accepts the reference's epoch map and the managed `{items: [...]}` list.
-   * Managed device revocation is single-epoch, so a device-scoped item maps
+   * GET /v2/trust/revocations[?domain_id=...&cursor=...] — device id →
+   * revocation epoch, consumed as the ISCP v0.2 iscp.trust.revocations.v2
+   * paginated feed. Pages are followed until next_cursor is absent (bounded);
+   * managed device revocation is single-epoch, so a device-scoped item maps
    * to epoch 1; grant-only items do not raise a device epoch and are dropped
-   * from this feed (grant lifecycle is read via grantStatus).
+   * from this projection (grant lifecycle is read via grantStatus).
    */
   async revocations(): Promise<Record<string, number>> {
-    const response = await this.fetchImpl(`${this.baseUrl}/v2/trust/revocations${this.domainQuery('?')}`);
-    if (!response.ok) await parseError(response, 'revocations feed');
-    const body = z.union([RevocationListSchema, RevocationEpochMapSchema]).parse(await response.json());
-    if (!('items' in body) || !Array.isArray(body.items)) {
-      return body as Record<string, number>;
-    }
     const epochs: Record<string, number> = {};
-    for (const item of body.items) {
-      if (item.device_id !== undefined) {
-        epochs[item.device_id] = Math.max(epochs[item.device_id] ?? 0, 1);
+    let cursor: string | undefined;
+    // 64 pages × up-to-200 items bounds a hostile/looping feed without
+    // truncating any realistic deployment.
+    for (let page = 0; page < 64; page++) {
+      const cursorQuery = cursor !== undefined ? `${this.domainId !== undefined ? '&' : '?'}cursor=${encodeURIComponent(cursor)}` : '';
+      const response = await this.fetchImpl(`${this.baseUrl}/v2/trust/revocations${this.domainQuery('?')}${cursorQuery}`);
+      if (!response.ok) await parseError(response, 'revocations feed');
+      const body = RevocationListSchema.parse(await response.json());
+      for (const item of body.items) {
+        if (item.device_id !== undefined) {
+          epochs[item.device_id] = Math.max(epochs[item.device_id] ?? 0, 1);
+        }
       }
+      if (body.next_cursor === undefined) return epochs;
+      cursor = body.next_cursor;
     }
-    return epochs;
+    throw iscpError(IscpErrorCodes.TrustInvalid, 'revocations feed did not terminate within the page bound', { retryable: true });
   }
 
   /** POST /v2/trust/keys/rotate (admin) — promotes the next signing key to active. */

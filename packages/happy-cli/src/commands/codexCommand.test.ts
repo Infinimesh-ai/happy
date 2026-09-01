@@ -1,15 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  mockAuthAndSetupMachineIfNeeded: vi.fn(),
+  mockResolveSessionNetwork: vi.fn(),
   mockRunCodex: vi.fn(),
   mockExtractCodexResumeFlag: vi.fn(),
   mockExtractNoSandboxFlag: vi.fn(),
   mockEnsureDaemonRunning: vi.fn(),
 }))
 
-vi.mock('@/ui/auth', () => ({
-  authAndSetupMachineIfNeeded: mocks.mockAuthAndSetupMachineIfNeeded,
+vi.mock('@/iscp/networkStartup', () => ({
+  resolveSessionNetwork: mocks.mockResolveSessionNetwork,
 }))
 
 vi.mock('@/codex/runCodex', () => ({
@@ -33,8 +33,10 @@ import { handleCodexCommand } from './codexCommand'
 describe('handleCodexCommand', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mocks.mockAuthAndSetupMachineIfNeeded.mockResolvedValue({
+    mocks.mockResolveSessionNetwork.mockResolvedValue({
+      mode: 'legacy',
       credentials: { token: 'token' },
+      machineId: 'machine-test',
     })
     mocks.mockExtractNoSandboxFlag.mockImplementation((args: string[]) => ({
       noSandbox: false,
@@ -53,7 +55,7 @@ describe('handleCodexCommand', () => {
 
     expect(mocks.mockEnsureDaemonRunning).toHaveBeenCalledTimes(1)
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
-      credentials: { token: 'token' },
+      network: { mode: 'legacy', credentials: { token: 'token' }, machineId: 'machine-test' },
       startedBy: 'terminal',
       noSandbox: false,
       resumeThreadId: undefined,
@@ -79,7 +81,7 @@ describe('handleCodexCommand', () => {
     await handleCodexCommand(['--no-sandbox', '--resume', 'thread-123', '--started-by', 'daemon'])
 
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
-      credentials: { token: 'token' },
+      network: { mode: 'legacy', credentials: { token: 'token' }, machineId: 'machine-test' },
       startedBy: 'daemon',
       noSandbox: true,
       resumeThreadId: 'thread-123',
@@ -93,7 +95,7 @@ describe('handleCodexCommand', () => {
     await handleCodexCommand(['--permission-mode', 'yolo'])
 
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
-      credentials: { token: 'token' },
+      network: { mode: 'legacy', credentials: { token: 'token' }, machineId: 'machine-test' },
       startedBy: undefined,
       noSandbox: false,
       resumeThreadId: undefined,
@@ -107,7 +109,7 @@ describe('handleCodexCommand', () => {
     await handleCodexCommand(['--yolo'])
 
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
-      credentials: { token: 'token' },
+      network: { mode: 'legacy', credentials: { token: 'token' }, machineId: 'machine-test' },
       startedBy: undefined,
       noSandbox: false,
       resumeThreadId: undefined,
@@ -121,7 +123,7 @@ describe('handleCodexCommand', () => {
     await handleCodexCommand(['--model', 'gpt-5.4', '--effort', 'xhigh'])
 
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
-      credentials: { token: 'token' },
+      network: { mode: 'legacy', credentials: { token: 'token' }, machineId: 'machine-test' },
       startedBy: undefined,
       noSandbox: false,
       resumeThreadId: undefined,

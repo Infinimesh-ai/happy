@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/Infinimesh-ai/ISCP",
-  "commit": "413d767bd8b47a8c6b7430115bf60dc283aebbc0",
-  "pinnedAt": "2026-07-23",
-  "note": "All protocol behavior and conformance vectors in this package are derived from this exact revision. Bump deliberately: re-read spec/ and schemas/json/, regenerate test/vectors via `pnpm sync-vectors`, and re-run the docker harness in environments/iscp."
+  "commit": "fa1d493c278f13e3588ad173c19695c9f5b9ec2d",
+  "pinnedAt": "2026-08-27",
+  "note": "All protocol behavior and conformance vectors in this package are derived from this exact revision (upstream tag v0.2.0-rc.1, the ISCP v0.2 pre-release). Bump deliberately: re-read spec/ and schemas/json/, regenerate test/vectors via `pnpm sync-vectors`, and re-run the docker harness in environments/iscp."
 }

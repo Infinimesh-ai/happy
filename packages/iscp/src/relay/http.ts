@@ -24,6 +24,8 @@ import {
   TrustGrantSchema,
   type DeliveryReceipt,
   type DeviceProof,
+  PAIRING_TICKET_V3_TYPE,
+  type AnyPairingTicket,
   type PairingTicket,
   type SecureEnvelope,
   type SignedDescriptor,
@@ -226,7 +228,7 @@ export class RelayHttpClient {
    */
   async registerWithSignedTicket(
     device: Device,
-    ticket: PairingTicket,
+    ticket: AnyPairingTicket,
     opts?: { displayName?: string; metadata?: Record<string, unknown>; idempotencyKey?: string },
   ): Promise<SignedTicketRegistration> {
     const proof = createDeviceProof(this.provider, device, {
@@ -235,8 +237,11 @@ export class RelayHttpClient {
       now: this.now(),
     });
     const path = '/v2/relay/devices/register-with-ticket';
+    // ISCP v0.2 tickets travel under the ticket_v3 key; the server enforces
+    // the grant role invariants (grant_audience_consumer fails closed).
+    const ticketField = ticket.type === PAIRING_TICKET_V3_TYPE ? { ticket_v3: ticket } : { ticket };
     const body = JSON.stringify({
-      ticket,
+      ...ticketField,
       identity: device.identity,
       identity_proof: proof,
       ...(opts?.displayName !== undefined ? { display_name: opts.displayName } : {}),

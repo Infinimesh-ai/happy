@@ -45,7 +45,7 @@ Current session wire payload shape (decrypted message body):
 - envelope-level role remains inside `content.role` (`'user' | 'agent'`)
 - envelope timestamp is required as `content.time` (Unix ms)
 
-### 3. Phone text view (`happy/phone-text-view.v1`)
+### 3. Phone text view (`happy/phone-text-view.v3`)
 
 Shared from `wire/textView.ts` (OPS 2026-08-18 §10.16):
 - `PhoneTextViewBodySchema` (`PhoneTextViewUserBodySchema` / `PhoneTextViewAgentBodySchema`) — the ONLY bodies a text-permission ISCP peer may receive: `{role:'user'|'agent', content:{type:'text', text}}` (user bodies keep `localKey`).

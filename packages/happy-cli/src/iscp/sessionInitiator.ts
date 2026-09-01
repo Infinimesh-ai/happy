@@ -5,6 +5,8 @@
  *
  * State machine per profile:
  *   connecting → ready                      openSession resolved (manifests exchanged)
+ *   ready → peer_stale → reopening          authenticated/controlled reopen fired
+ *   reopening → ready                        fresh Session id/transcript and manifests exchanged
  *   connecting → authorization_expired      grant expired locally/remotely → `happy iscp renew`
  *   connecting → failed(<category>)         non-retryable failure; loop ends
  *
@@ -19,7 +21,7 @@
 
 import { IscpError, IscpErrorCodes } from '@slopus/iscp'
 
-export type ProfileSessionState = 'connecting' | 'ready' | 'authorization_expired' | 'failed'
+export type ProfileSessionState = 'connecting' | 'ready' | 'peer_stale' | 'reopening' | 'authorization_expired' | 'failed'
 
 /** Diagnostic snapshot of one profile's peer, served via GET /iscp/peer-status. */
 export interface ProfilePeerStatus {
@@ -33,6 +35,17 @@ export interface ProfilePeerStatus {
   sessionDetail?: string
   /** The grant audience this daemon dials (the phone device id). */
   peerDeviceId: string
+  /** Current verified Session metadata. No transcript material is exposed. */
+  sessionId?: string
+  sessionRole?: 'initiator' | 'responder'
+  sessionAttempt: number
+  sessionReopenCount: number
+  sessionReopenCoalesceCount: number
+  helloAttemptCount: number
+  helloSupersededCount: number
+  helloCoalescedCount: number
+  pendingCount: number
+  sessionLastVerifiedAt?: number
 }
 
 export type SessionFailureCategory = 'transport_failed' | 'grant_expired' | 'revoked' | 'identity_unavailable' | 'protocol_error'
@@ -74,6 +87,11 @@ export function classifySessionFailure(error: unknown): SessionFailureAction {
 }
 
 export const SESSION_BACKOFF_SCHEDULE_MS = [5_000, 10_000, 20_000, 30_000, 60_000]
+export interface SessionRuntimeStatus {
+  sessionId: string
+  role: 'initiator' | 'responder'
+  lastAuthenticatedAt?: number
+}
 
 export interface SessionInitiatorDeps {
   /** The grant audience — the phone allowed to control this machine. */
@@ -87,6 +105,18 @@ export interface SessionInitiatorDeps {
   log: (line: string) => void
   /** Per-attempt openSession timeout (default 60s). */
   timeoutMs?: number
+  /** Keep the supervisor alive after ready so controlled reopen can wake it. */
+  superviseReopen?: boolean
+  /**
+   * Optional authenticated-idle policy for non-managed deployments. Managed
+   * Happy profiles deliberately omit it: an idle/offline phone must not
+   * cause an unbounded queue of Hellos.
+   */
+  livenessWindowMs?: number
+  /** Metadata-only activity source from IscpPeer. */
+  sessionStatus?: () => SessionRuntimeStatus | undefined
+  /** Clear generation-scoped consumers immediately before closing the old Session. */
+  onBeforeReopen?: (cause: string, previous: SessionRuntimeStatus | undefined) => void
   backoffScheduleMs?: number[]
   /** Jitter ratio applied to each delay (default 0.2 = ±20%; tests pass 0). */
   jitterRatio?: number
@@ -116,6 +146,11 @@ function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
 export interface SessionInitiatorHandle {
   /** Cancel the loop. Callers should also closeSession() so a pending openSession settles. */
   stop: () => void
+  /**
+   * Ask a ready Session to re-open. Concurrent requests coalesce; returns
+   * false while an initial connection/reopen is already in progress.
+   */
+  requestReopen: (cause?: string) => boolean
   /** Resolves when the loop has fully terminated. Never rejects. */
   done: Promise<void>
 }
@@ -128,22 +163,74 @@ export function startSessionInitiator(deps: SessionInitiatorDeps): SessionInitia
   const now = deps.now ?? (() => Date.now())
   const sleep = deps.sleep ?? defaultSleep
   const timeoutMs = deps.timeoutMs ?? 60_000
+  let phase: ProfileSessionState = 'connecting'
+  let reopenRequested: { cause: string; resolve: () => void } | undefined
+  let reopenWakePending = false
+
+  const waitForReopen = async (windowMs?: number): Promise<string | undefined> => {
+    while (!signal.aborted) {
+      const lastVerifiedAt = deps.sessionStatus?.()?.lastAuthenticatedAt ?? now()
+      const remaining = windowMs === undefined
+        ? undefined
+        : Math.max(0, lastVerifiedAt + windowMs - now())
+      let timerElapsed = false
+      const controlled = new Promise<void>((resolve) => {
+        reopenRequested = { cause: reopenRequested?.cause ?? 'controlled_reopen', resolve }
+      })
+      if (remaining === undefined) {
+        await controlled
+      } else {
+        await Promise.race([
+          sleep(remaining, signal).then(() => { timerElapsed = true }),
+          controlled,
+        ])
+      }
+      if (signal.aborted) return undefined
+      if ((!timerElapsed || remaining === undefined) && reopenRequested !== undefined) {
+        const cause = reopenRequested.cause
+        reopenRequested = undefined
+        reopenWakePending = false
+        return cause
+      }
+      reopenRequested = undefined
+      reopenWakePending = false
+      if (windowMs === undefined) continue
+      const latestVerifiedAt = deps.sessionStatus?.()?.lastAuthenticatedAt ?? lastVerifiedAt
+      if (latestVerifiedAt + windowMs <= now()) return 'liveness_window_elapsed'
+      // Authenticated activity arrived while the timer was running. Keep the
+      // same Session and wait only for the new remainder.
+    }
+    return undefined
+  }
 
   const done = (async () => {
     let attempt = 0
+    let hasBeenReady = false
     while (!signal.aborted) {
       if (deps.grantExpiresAt().getTime() <= now()) {
         deps.onState('authorization_expired', 'grant_expired')
         deps.log(`trust grant for peer ${deps.peerDeviceId} has expired; run: happy iscp renew <renewal-id>`)
         return
       }
-      deps.onState('connecting')
+      phase = hasBeenReady ? 'reopening' : 'connecting'
+      deps.onState(phase)
       try {
         await deps.openSession(deps.peerDeviceId, { timeoutMs })
         if (signal.aborted) return
+        phase = 'ready'
         deps.onState('ready')
         deps.log(`session ready with peer ${deps.peerDeviceId} (manifests exchanged)`)
-        return
+        attempt = 0
+        if (deps.superviseReopen !== true && deps.livenessWindowMs === undefined) return
+        const cause = await waitForReopen(deps.livenessWindowMs)
+        if (signal.aborted || cause === undefined) return
+        const previous = deps.sessionStatus?.()
+        phase = 'peer_stale'
+        deps.onState('peer_stale', cause)
+        deps.onBeforeReopen?.(cause, previous)
+        deps.closeSession(deps.peerDeviceId)
+        hasBeenReady = true
+        continue
       } catch (error) {
         if (signal.aborted) return
         const action = classifySessionFailure(error)
@@ -172,5 +259,20 @@ export function startSessionInitiator(deps: SessionInitiatorDeps): SessionInitia
     /* the loop never throws; belt and braces */
   })
 
-  return { stop: () => controller.abort(), done }
+  return {
+    stop: () => {
+      controller.abort()
+      reopenRequested?.resolve()
+      reopenRequested = undefined
+      reopenWakePending = false
+    },
+    requestReopen: (cause = 'controlled_reopen') => {
+      if (signal.aborted || phase !== 'ready' || reopenRequested === undefined || reopenWakePending) return false
+      reopenWakePending = true
+      reopenRequested.cause = cause
+      reopenRequested.resolve()
+      return true
+    },
+    done,
+  }
 }
